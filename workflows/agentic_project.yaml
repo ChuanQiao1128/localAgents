@@ -1,0 +1,69 @@
+id: agentic_project
+name: Agentic Coding Runtime
+description: AI-native workflow for traceable, candidate-based, self-repairing verified patch generation.
+
+runtime: agentic_project
+
+stages:
+  - id: intent-contract
+    agent: orchestrator
+    writes:
+      - ".agent/runs/{run_id}/intent-contract.json"
+
+  - id: context-pack
+    agent: context-explorer
+    mode: read_only
+    writes:
+      - ".agent/runs/{run_id}/context-pack.json"
+
+  - id: eval-harness
+    agent: spec-compiler
+    mode: read_only_plus_eval_write
+    writes:
+      - ".agent/runs/{run_id}/eval-harness.json"
+
+  - id: task-slicing
+    agent: orchestrator
+    writes:
+      - ".agent/runs/{run_id}/task-slices.json"
+
+  - id: candidate-patches
+    agent: patch-worker
+    isolation: git_worktree
+    candidates: 1
+    writes:
+      - ".agent/runs/{run_id}/candidates/*/patch.diff"
+      - ".agent/runs/{run_id}/candidates/*/changed-files.json"
+      - ".agent/runs/{run_id}/candidates/*/run-log.jsonl"
+      - ".agent/runs/{run_id}/candidates/*/score.json"
+      - ".agent/runs/{run_id}/candidates/*/eval-results.json"
+
+  - id: repair-loop
+    agent: repair-agent
+    max_loops: 5
+    stop_on_repeated_failure_type: true
+    writes:
+      - ".agent/runs/{run_id}/candidates/*/repair-history.json"
+
+  - id: critic-panel
+    agents:
+      - correctness-critic
+      - regression-critic
+      - security-critic
+      - ux-critic
+      - overfit-critic
+    mode: read_only
+    writes:
+      - ".agent/runs/{run_id}/critics/*.md"
+
+  - id: promotion-gate
+    agent: integration-lead
+    deterministic_checks: true
+    writes:
+      - ".agent/runs/{run_id}/promotion-report.json"
+
+  - id: memory-update
+    agent: memory-curator
+    mode: proposed_only
+    writes:
+      - ".agent/runs/{run_id}/memory-update.proposed.json"

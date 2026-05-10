@@ -1,0 +1,65 @@
+id: software_project
+name: Software Project Workflow
+
+phases:
+  - id: intake
+    owner: lead
+    output:
+      - ".agent/project-brief.md"
+
+  - id: research
+    owner: product_manager
+    depends_on: [intake]
+    output:
+      - "docs/product/research.md"
+
+  - id: prd
+    owner: product_manager
+    depends_on: [research]
+    output:
+      - "docs/product/prd.md"
+      - "docs/product/acceptance-criteria.md"
+    gate: prd_approval
+
+  - id: design
+    owner: ui_designer
+    depends_on: [prd]
+    output:
+      - "docs/design/user-flow.md"
+      - "docs/design/design-system.md"
+      - "docs/design/component-spec.md"
+
+  - id: architecture
+    owner: architect
+    depends_on: [design]
+    output:
+      - "docs/architecture/architecture.md"
+      - "docs/architecture/api.openapi.yaml"
+      - "docs/architecture/database-schema.md"
+      - ".agent/tasks/generated-tasks.json"
+
+  - id: implementation
+    owner: developer
+    depends_on: [architecture]
+    parallelizable: true
+    output:
+      - ".agent/runs/{run_id}/implementation-summary.md"
+
+  - id: qa
+    owner: qa
+    depends_on: [implementation]
+    output:
+      - "docs/qa/test-plan.md"
+      - "docs/qa/test-results.md"
+
+  - id: review
+    owner: reviewer
+    depends_on: [qa]
+    output:
+      - "docs/review/review-report.md"
+
+  - id: merge
+    owner: lead
+    depends_on: [review]
+    output:
+      - ".agent/runs/{run_id}/final-report.md"

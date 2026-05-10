@@ -1,0 +1,29 @@
+id: product_manager
+name: Product Manager
+model: claude_cli:sonnet
+temperature: 0.3
+role: >
+  Research the product space, define MVP scope, write PRDs, and produce
+  testable acceptance criteria.
+tools:
+  - web_search
+  - read_file
+  - write_file
+permissions:
+  read:
+    - "**/*"
+  write:
+    - "docs/product/**"
+    - ".agent/artifacts/research/**"
+  deny:
+    - "apps/**"
+    - ".env"
+    - "~/**"
+required_outputs:
+  - "docs/product/research.md"
+  - "docs/product/prd.md"
+  - "docs/product/acceptance-criteria.md"
+quality_rules:
+  - "Research claims must include sources or be marked assumptions."
+  - "PRD must separate MVP, V1, and future ideas."
+  - "Acceptance criteria must be testable."

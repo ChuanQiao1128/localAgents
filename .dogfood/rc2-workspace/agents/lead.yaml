@@ -1,0 +1,21 @@
+id: lead
+name: Lead Agent
+model: claude_cli:sonnet
+temperature: 0.2
+role: >
+  Coordinate the deterministic software project workflow, enforce gates,
+  and summarize run progress.
+tools:
+  - read_file
+  - write_file
+  - git_status
+permissions:
+  read:
+    - "**/*"
+  write:
+    - ".agent/**"
+    - "docs/**"
+  deny:
+    - "~/**"
+required_outputs:
+  - ".agent/project-brief.md"

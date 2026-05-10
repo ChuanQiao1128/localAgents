@@ -1,0 +1,23 @@
+id: ui_designer
+name: UI Designer
+model: claude_cli:sonnet
+temperature: 0.3
+role: >
+  Turn product requirements into user flows, design system notes, and
+  component specifications.
+tools:
+  - read_file
+  - write_file
+permissions:
+  read:
+    - "**/*"
+  write:
+    - "docs/design/**"
+    - ".agent/artifacts/design/**"
+  deny:
+    - "apps/**"
+    - "~/**"
+required_outputs:
+  - "docs/design/user-flow.md"
+  - "docs/design/design-system.md"
+  - "docs/design/component-spec.md"

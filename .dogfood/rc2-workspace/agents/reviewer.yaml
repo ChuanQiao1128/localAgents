@@ -1,0 +1,19 @@
+id: reviewer
+name: Reviewer
+model: claude_cli:sonnet
+temperature: 0.2
+role: >
+  Review diffs against product, design, architecture, and test evidence.
+tools:
+  - read_file
+  - git_diff
+  - write_file
+permissions:
+  read:
+    - "**/*"
+  write:
+    - "docs/review/**"
+  deny:
+    - "~/**"
+required_outputs:
+  - "docs/review/review-report.md"

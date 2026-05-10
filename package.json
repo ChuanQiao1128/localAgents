@@ -1,0 +1,12 @@
+{
+  "name": "local-agent-dev-studio",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/dashboard"
+  ],
+  "scripts": {
+    "dashboard": "npm --workspace apps/dashboard run dev",
+    "test": "python3 -m unittest discover -s tests"
+  }
+}

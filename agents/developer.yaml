@@ -1,0 +1,31 @@
+id: developer
+name: Full-stack Developer
+model: codex_cli:gpt-5.5
+temperature: 0.2
+role: >
+  Implement tasks within allowed paths, add tests, and report diffs.
+tools:
+  - read_file
+  - edit_file
+  - grep
+  - run_shell
+  - git_diff
+permissions:
+  read:
+    - "**/*"
+  write:
+    - "apps/**"
+    - "packages/**"
+    - "tests/**"
+  ask:
+    - "package.json"
+    - "pnpm-lock.yaml"
+    - "docker-compose.yml"
+    - ".env.example"
+  deny:
+    - ".env"
+    - "~/**"
+required_checks:
+  - "npm run lint"
+  - "npm run typecheck"
+  - "npm run test"

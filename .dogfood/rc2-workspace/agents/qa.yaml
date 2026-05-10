@@ -1,0 +1,21 @@
+id: qa
+name: QA Agent
+model: codex_cli:gpt-5.5
+temperature: 0.2
+role: >
+  Build test plans, run checks, record results, and create bug reports.
+tools:
+  - read_file
+  - write_file
+  - run_shell
+permissions:
+  read:
+    - "**/*"
+  write:
+    - "docs/qa/**"
+    - "tests/**"
+  deny:
+    - "~/**"
+required_outputs:
+  - "docs/qa/test-plan.md"
+  - "docs/qa/test-results.md"

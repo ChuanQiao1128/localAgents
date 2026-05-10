@@ -1,0 +1,110 @@
+# Artifact contracts: programmatic checks that a phase's required outputs
+# meet structural minimums. These are NOT semantic graders — they catch
+# obvious skeletons (missing sections, parse failures, placeholder text)
+# without burning extra LLM calls.
+#
+# Each entry is keyed by relative path (matched as a suffix so phase output
+# templates with `{run_id}` placeholders still work). A file with no entry
+# here gets a generic "non-empty + minimum-length" check only.
+#
+# Validators are additive: each contributes to a 0-100 validation_score.
+# All-pass => 100. Each failed validator subtracts from 100 in proportion to
+# its weight (default 100/N for N validators on the artifact).
+
+contracts:
+  ".agent/project-brief.md":
+    min_length_chars: 400
+    required_sections:
+      - Problem
+      - User
+      - Success
+    must_not_contain:
+      - "TODO"
+      - "TBD"
+
+  "docs/product/research.md":
+    min_length_chars: 800
+    required_sections:
+      - Market
+      - Alternatives
+      - Differentiat
+    must_not_contain:
+      - "TBD"
+      - "lorem ipsum"
+
+  "docs/product/prd.md":
+    critical: true
+    min_length_chars: 1500
+    required_sections:
+      - Problem
+      - Users
+      - MVP
+      - Acceptance
+      - "Non-Goals"
+      - Risks
+    must_not_contain:
+      - "TBD"
+      - "..."
+      - "lorem ipsum"
+
+  "docs/product/acceptance-criteria.md":
+    critical: true
+    min_length_chars: 600
+    must_match_pattern: "AC-\\d+"      # at least one AC ID like AC-001
+    min_pattern_count: 5
+
+  "docs/design/user-flow.md":
+    min_length_chars: 600
+    required_sections:
+      - Flow
+
+  "docs/design/design-system.md":
+    min_length_chars: 600
+    required_sections:
+      - Token
+
+  "docs/design/component-spec.md":
+    min_length_chars: 600
+
+  "docs/architecture/architecture.md":
+    min_length_chars: 1000
+    required_sections:
+      - Overview
+      - Components
+      - Data
+    must_not_contain:
+      - "TODO"
+
+  "docs/architecture/api.openapi.yaml":
+    critical: true
+    must_parse_as_yaml: true
+    required_yaml_keys:
+      - openapi
+      - info
+      - paths
+
+  "docs/architecture/database-schema.md":
+    min_length_chars: 400
+
+  ".agent/tasks/generated-tasks.json":
+    critical: true
+    must_parse_as_json: true
+    json_required_path: "$[0].id"   # at least one item with .id (root must be array)
+    min_json_array_items: 4
+
+  "docs/qa/test-plan.md":
+    min_length_chars: 500
+    required_sections:
+      - Coverage
+
+  "docs/qa/test-results.md":
+    min_length_chars: 400
+
+  "docs/review/review-report.md":
+    min_length_chars: 500
+    required_sections:
+      - Status
+
+# Default applied when no path-specific contract matches.
+default:
+  min_length_chars: 200

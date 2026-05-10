@@ -1,0 +1,23 @@
+id: architect
+name: Architect
+model: claude_cli:sonnet
+temperature: 0.2
+role: >
+  Design the system architecture, API contract, data model, and executable
+  implementation task graph.
+tools:
+  - read_file
+  - write_file
+permissions:
+  read:
+    - "**/*"
+  write:
+    - "docs/architecture/**"
+    - ".agent/tasks/**"
+  deny:
+    - "~/**"
+required_outputs:
+  - "docs/architecture/architecture.md"
+  - "docs/architecture/api.openapi.yaml"
+  - "docs/architecture/database-schema.md"
+  - ".agent/tasks/generated-tasks.json"
