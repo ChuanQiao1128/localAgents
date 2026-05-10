@@ -1,0 +1,21 @@
+agentic:
+  patch_worker: codex
+  codex:
+    command: /opt/homebrew/bin/codex
+    sandbox: workspace-write
+    ask_for_approval: on-request
+    timeout_sec: 600
+    max_prompt_chars: 60000
+
+autonomous:
+  budgets:
+    max_tasks_per_session: 1
+    max_total_inner_runs: 1
+    max_candidates_per_task: 1
+    max_repair_attempts_per_candidate: 1
+    max_abandoned_tasks: 1
+    max_corrective_tasks: 1
+
+deploy:
+  enabled: false
+  target: vercel

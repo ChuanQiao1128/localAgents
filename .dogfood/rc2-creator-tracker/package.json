@@ -1,0 +1,9 @@
+{
+  "name": "rc2-creator-tracker",
+  "private": true,
+  "version": "0.0.0",
+  "description": "RC-2A dogfood project for Local Agent Dev Studio. Real git repo, real npm run build, deliberately tiny dependencies.",
+  "scripts": {
+    "build": "node scripts/build.mjs"
+  }
+}
