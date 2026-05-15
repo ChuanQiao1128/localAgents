@@ -20,3 +20,10 @@ node_modules/
 dist/
 .npm/
 .codex/
+
+# Local dogfood scratch/baseline directories
+.tmp-*/
+.dogfood/_*/
+.dogfood/rc3*/
+.dogfood/rc4a3-change-run-tiny/
+.dogfood/rc2-creator-tracker/vercel.json
