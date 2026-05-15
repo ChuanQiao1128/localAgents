@@ -760,6 +760,76 @@ def build_parser() -> argparse.ArgumentParser:
     apply_mode.add_argument("--yes", action="store_true", help="Run all Apply Gate checks AND apply the patch to the working tree.")
     candidates_apply.set_defaults(handler=cmd_agentic_candidates_apply)
 
+    # RC-4A.1: Change Request Mode foundation. The `change` group is the
+    # change-mode counterpart to `autonomous`: where autonomous drives a
+    # greenfield project from requirements.md, change drives a SINGLE
+    # modification to an existing project from change-request.md. RC-4A.1
+    # ships only the artifact + CLI foundation; `change run` wiring to
+    # AutonomousController lands in RC-4A.2.
+    change_parser = subcommands.add_parser(
+        "change",
+        help="RC-4A: drive a single modification to an existing project from a change-request.md.",
+    )
+    change_subcommands = change_parser.add_subparsers(dest="change_command", required=True)
+
+    change_new = change_subcommands.add_parser(
+        "new",
+        help="Create a change session from a change-request.md (parses input, scans repo, writes artifacts; does NOT run Codex).",
+    )
+    change_new.add_argument("--from", dest="from_path", required=True, help="Path to change-request.md")
+    change_new.add_argument("--project", default=None, help="Project id. Defaults to latest project.")
+    change_new.add_argument("--json", action="store_true", help="Print raw JSON of the created change.")
+    change_new.set_defaults(handler=cmd_change_new)
+
+    change_list = change_subcommands.add_parser(
+        "list",
+        help="List all change sessions for the project (oldest first).",
+    )
+    change_list.add_argument("--project", default=None, help="Project id. Defaults to latest project.")
+    change_list.add_argument("--json", action="store_true", help="Print raw JSON list.")
+    change_list.set_defaults(handler=cmd_change_list)
+
+    change_show = change_subcommands.add_parser(
+        "show",
+        help="Show a change session's contract + artifact paths.",
+    )
+    change_show.add_argument("change_id", nargs="?", default="latest", help="Change id, or 'latest' (default).")
+    change_show.add_argument("--project", default=None, help="Project id. Defaults to latest project.")
+    change_show.add_argument("--json", action="store_true", help="Print raw JSON dump.")
+    change_show.set_defaults(handler=cmd_change_show)
+
+    change_status = change_subcommands.add_parser(
+        "status",
+        help="Show the change session's current state (RC-4A.1: created / ready_for_run / applied / delivered).",
+    )
+    change_status.add_argument("change_id", nargs="?", default="latest", help="Change id, or 'latest' (default).")
+    change_status.add_argument("--project", default=None, help="Project id. Defaults to latest project.")
+    change_status.add_argument("--json", action="store_true", help="Print raw JSON dump.")
+    change_status.set_defaults(handler=cmd_change_status)
+
+    change_validate = change_subcommands.add_parser(
+        "validate",
+        help="Validate the change session's persisted artifacts (change-contract.json + delivery-report.md if present).",
+    )
+    change_validate.add_argument("change_id", nargs="?", default="latest", help="Change id, or 'latest' (default).")
+    change_validate.add_argument("--project", default=None, help="Project id. Defaults to latest project.")
+    change_validate.add_argument("--json", action="store_true", help="Print raw JSON validation report.")
+    change_validate.set_defaults(handler=cmd_change_validate)
+
+    change_run = change_subcommands.add_parser(
+        "run",
+        help="RC-4A.2: run the change end-to-end via the autonomous pipeline (1-task task-graph).",
+    )
+    change_run.add_argument("change_id", nargs="?", default="latest", help="Change id, or 'latest' (default).")
+    change_run.add_argument("--project", default=None, help="Project id. Defaults to latest project.")
+    change_run.add_argument("--json", action="store_true", help="Print raw JSON result.")
+    change_run.add_argument(
+        "--allow-dirty-worktree",
+        action="store_true",
+        help="Skip the pre-run worktree-clean check (override at your own risk).",
+    )
+    change_run.set_defaults(handler=cmd_change_run)
+
     workflows_parser = subcommands.add_parser("workflows", help="List workflow configs.")
     workflows_parser.set_defaults(handler=cmd_workflows)
 
@@ -2040,8 +2110,27 @@ def cmd_autonomous_start(args: argparse.Namespace) -> None:
     from orchestrator.core.deploy import load_agentic_config
     agentic_config = load_agentic_config(project_path)
 
+    # RC-2C.1.3: hold a mutable session ref so `_run_inner_loop` can
+    # read session.budgets["max_candidates_per_task"] at CALL time
+    # (the controller passes it in via start_or_resume below). Closure
+    # capture, not snapshot — budgets changes during a long session
+    # would also propagate.
+    _session_ref: dict[str, Any] = {"session": None}
+
     def _run_inner_loop(*, project: dict[str, Any], intent_overrides: dict[str, Any]) -> AgenticRunResult:
-        return runtime.run(
+        # Default candidate_count is 3 (CANDIDATE_STRATEGIES len). When
+        # autonomous.budgets.max_candidates_per_task is configured AND
+        # has a positive int value, propagate it as the runtime's
+        # candidate_count. Pre-fix this knob was silently ignored —
+        # operators setting `max_candidates_per_task: 1` to control
+        # token spend still saw 3 candidates run (RC-2B.2 Observation A).
+        max_cand = None
+        sess = _session_ref.get("session")
+        if sess is not None:
+            raw = sess.budgets.get("max_candidates_per_task")
+            if isinstance(raw, int) and raw >= 1:
+                max_cand = raw
+        kwargs: dict[str, Any] = dict(
             project=project,
             intent_overrides=intent_overrides,
             patch_worker=agentic_config.patch_worker,
@@ -2051,6 +2140,9 @@ def cmd_autonomous_start(args: argparse.Namespace) -> None:
             codex_ask_for_approval=agentic_config.codex.ask_for_approval,
             codex_command=agentic_config.codex.command,
         )
+        if max_cand is not None:
+            kwargs["candidate_count"] = max_cand
+        return runtime.run(**kwargs)
 
     def _apply(*, project_path: Path, run_dir: Path, selected_candidate: str) -> dict[str, Any]:
         record = apply_selected_candidate(
@@ -2061,6 +2153,7 @@ def cmd_autonomous_start(args: argparse.Namespace) -> None:
 
     controller = AutonomousController(project=project, run_inner_loop=_run_inner_loop, apply_candidate=_apply)
     session = controller.start_or_resume()
+    _session_ref["session"] = session
     create_session_branch(project_path, session.session_id)
     print(f"Session: {session.session_id}")
     print(f"Branch: {session.branch}")
@@ -2708,14 +2801,31 @@ def cmd_autonomous_smoke(args: argparse.Namespace) -> None:
     review_id: str | None = None
     rollback_id: str | None = None
     rollback_status: str | None = None
+    # RC-2C.1.1: state reconciliation. Pre-fix, ONLY the failure branch
+    # persisted session.deployment.latest_smoke_*; success branch silently
+    # returned, so a manual smoke that healed a previously-failed run
+    # left the session showing the OLD failed smoke (real bug surfaced
+    # in RC-2C against session_b82c6d6a3c). Post-fix: every manual smoke
+    # outcome — passed OR failed — updates session state, then saves.
+    controller = AutonomousController(project=project, run_inner_loop=lambda **kw: None)
+    session.deployment["latest_smoke_check_id"] = smoke_check_id
+    session.deployment["latest_smoke_status"] = smoke_result.status
+    if smoke_result.status == "passed":
+        session.deployment["latest_smoke_failure_type"] = None
+        # If the latest deployment is itself ready, the deployment-level
+        # status advances from `deployed` → `verified` to reflect that
+        # smoke confirmed the URL responds.
+        if session.deployment.get("status") in {"deployed", "smoke-failed"}:
+            session.deployment["status"] = "verified"
+        controller._save_session(session)  # noqa: SLF001
     if smoke_result.status != "passed":
         # Manual smoke failure also creates a review item — same audit
         # trail as the controller-driven path.
-        controller = AutonomousController(project=project, run_inner_loop=lambda **kw: None)
-        session.deployment["latest_smoke_check_id"] = smoke_check_id
-        session.deployment["latest_smoke_status"] = smoke_result.status
         failure_type = (smoke_result.failure or {}).get("failure_type") or "unknown"
         session.deployment["latest_smoke_failure_type"] = failure_type
+        if session.deployment.get("status") in {"verified", "deployed", "ready"}:
+            session.deployment["status"] = "smoke-failed"
+        controller._save_session(session)  # noqa: SLF001
         review = controller._emit_review_item(  # noqa: SLF001
             session,
             source_type="smoke_check_failure",
@@ -2849,6 +2959,16 @@ def cmd_autonomous_rollback(args: argparse.Namespace) -> None:
     )
     session.deployment["latest_rollback_id"] = rollback_id
     session.deployment["latest_rollback_status"] = rollback_result.status
+    if rollback_result.failure:
+        session.deployment["latest_rollback_failure_type"] = rollback_result.failure.get("failure_type")
+    else:
+        session.deployment["latest_rollback_failure_type"] = None
+    # RC-2C.1.1: persist the rollback outcome back into session state
+    # so subsequent `status` / final-run-status / validate-artifacts
+    # see the latest rollback. Pre-fix this only mutated the dict
+    # in-process and the writes were discarded at exit.
+    controller = AutonomousController(project=project, run_inner_loop=lambda **kw: None)
+    controller._save_session(session)  # noqa: SLF001
 
     if args.json:
         print(json.dumps({
@@ -3664,6 +3784,336 @@ def cmd_teams_review(args: argparse.Namespace) -> None:
     print(f"QA team contract: {result.qa_team_contract_path}")
     print(f"Review team contract: {result.review_team_contract_path}")
     print(f"Lead team contract: {result.lead_team_contract_path}")
+
+
+# ---------------------------------------------------------------------------
+# RC-4A.1: change-mode CLI handlers.
+# Foundation only — `change run` is intentionally a stub that points to RC-4A.2
+# so operators see the same shape they'll use later.
+# ---------------------------------------------------------------------------
+def cmd_change_new(args: argparse.Namespace) -> None:
+    from orchestrator.core.change_contract import create_change
+    from orchestrator.core.change_request_parser import ChangeRequestParseError
+
+    paths = _initialized_paths(args.root)
+    engine = create_engine(paths)
+    project_id = args.project or _latest_project_id(engine)
+    project = engine.require_project(project_id)
+    project_path = Path(project["path"])
+
+    try:
+        created = create_change(project_path, Path(args.from_path))
+    except ChangeRequestParseError as exc:
+        raise SystemExit(f"error: {exc}")
+    except FileNotFoundError as exc:
+        raise SystemExit(f"error: {exc}")
+
+    if args.json:
+        print(json.dumps({
+            "change_id": created.change_id,
+            "change_dir": str(created.change_dir),
+            "artifacts": {
+                "change_request_md": str(created.change_request_path),
+                "change_contract_json": str(created.change_contract_path),
+                "repo_onboarding_md": str(created.repo_onboarding_path),
+                "implementation_plan_md": str(created.implementation_plan_path),
+                "acceptance_criteria_json": str(created.acceptance_criteria_path),
+            },
+        }, indent=2))
+        return
+
+    print(f"Created change: {created.change_id}")
+    print(f"Project: {project['name']} ({project_id})")
+    print(f"Change dir: {created.change_dir}")
+    print()
+    print("Artifacts written:")
+    print(f"  - {created.change_request_path}")
+    print(f"  - {created.change_contract_path}")
+    print(f"  - {created.repo_onboarding_path}")
+    print(f"  - {created.implementation_plan_path}")
+    print(f"  - {created.acceptance_criteria_path}")
+    print()
+    print("Next:")
+    print(f"  agent-studio change show {created.change_id} --project {project_id}")
+    print(f"  agent-studio change validate {created.change_id} --project {project_id}")
+    print(f"  agent-studio change run {created.change_id} --project {project_id}   # RC-4A.2+")
+
+
+def cmd_change_list(args: argparse.Namespace) -> None:
+    from orchestrator.core.change_contract import list_changes
+
+    paths = _initialized_paths(args.root)
+    engine = create_engine(paths)
+    project_id = args.project or _latest_project_id(engine)
+    project = engine.require_project(project_id)
+    project_path = Path(project["path"])
+
+    rows = list_changes(project_path)
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return
+
+    print(f"Project: {project['name']} ({project_id})")
+    print(f"Change sessions: {len(rows)}")
+    if not rows:
+        print("(none yet — run `agent-studio change new --from <change-request.md>`)")
+        return
+    print()
+    print(f"{'change_id':22} {'created_at':25} goal")
+    print(f"{'-'*22} {'-'*25} {'-'*40}")
+    for row in rows:
+        goal = (row.get("goal") or "").splitlines()[0][:60]
+        print(f"{row['change_id']:22} {row.get('created_at', ''):25} {goal}")
+
+
+def cmd_change_show(args: argparse.Namespace) -> None:
+    from orchestrator.core.change_contract import (
+        change_status_summary,
+        read_change_contract,
+        resolve_change_id,
+    )
+
+    paths = _initialized_paths(args.root)
+    engine = create_engine(paths)
+    project_id = args.project or _latest_project_id(engine)
+    project = engine.require_project(project_id)
+    project_path = Path(project["path"])
+
+    try:
+        change_id = resolve_change_id(project_path, args.change_id)
+    except FileNotFoundError as exc:
+        raise SystemExit(f"error: {exc}")
+
+    contract = read_change_contract(project_path, change_id)
+    summary = change_status_summary(project_path, change_id)
+
+    if args.json:
+        print(json.dumps({"summary": summary, "contract": contract}, indent=2))
+        return
+
+    print(f"Project: {project['name']} ({project_id})")
+    print(f"Change: {change_id}")
+    print(f"State: {summary['state']}")
+    print(f"Created at: {contract.get('created_at')}")
+    print(f"Goal: {contract.get('goal')}")
+    if contract.get("scope_paths"):
+        print("Scope paths:")
+        for sp in contract["scope_paths"]:
+            print(f"  - {sp}")
+    else:
+        print("Scope paths: (none declared; scope_missing=True)" if contract.get("scope_missing") else "Scope paths: (none)")
+    if contract.get("non_goals"):
+        print("Non-goals:")
+        for ng in contract["non_goals"]:
+            print(f"  - {ng}")
+    print(f"Acceptance criteria: {len(contract.get('acceptance') or [])} item(s)")
+    for i, criterion in enumerate(contract.get("acceptance") or [], start=1):
+        print(f"  AC-{i:03d}: {criterion}")
+    print()
+    print("Artifacts:")
+    for key, value in (summary.get("artifacts") or {}).items():
+        present = "exists" if value and Path(value).exists() else "(not yet)"
+        print(f"  - {key}: {value or '(not yet)'} [{present}]")
+
+
+def cmd_change_status(args: argparse.Namespace) -> None:
+    from orchestrator.core.change_contract import change_status_summary, resolve_change_id
+
+    paths = _initialized_paths(args.root)
+    engine = create_engine(paths)
+    project_id = args.project or _latest_project_id(engine)
+    project = engine.require_project(project_id)
+    project_path = Path(project["path"])
+
+    try:
+        change_id = resolve_change_id(project_path, args.change_id)
+    except FileNotFoundError as exc:
+        raise SystemExit(f"error: {exc}")
+
+    summary = change_status_summary(project_path, change_id)
+    if args.json:
+        print(json.dumps(summary, indent=2))
+        return
+    print(f"Project: {project['name']} ({project_id})")
+    print(f"Change: {change_id}")
+    print(f"State: {summary['state']}")
+    print(f"Goal: {summary['goal']}")
+    print(f"Scope paths: {len(summary['scope_paths'])} (missing={summary['scope_missing']})")
+    print(f"Non-goals: {len(summary['non_goals'])}")
+    print(f"Acceptance criteria: {summary['acceptance_count']}")
+    print(f"Created at: {summary['created_at']}")
+    print(f"Change dir: {summary['change_dir']}")
+
+
+def cmd_change_validate(args: argparse.Namespace) -> None:
+    from orchestrator.core.artifact_validation import (
+        validate_applied_change,
+        validate_change_contract,
+        validate_delivery_report_text,
+    )
+    from orchestrator.core.change_contract import change_dir, resolve_change_id
+
+    paths = _initialized_paths(args.root)
+    engine = create_engine(paths)
+    project_id = args.project or _latest_project_id(engine)
+    project = engine.require_project(project_id)
+    project_path = Path(project["path"])
+
+    try:
+        change_id = resolve_change_id(project_path, args.change_id)
+    except FileNotFoundError as exc:
+        raise SystemExit(f"error: {exc}")
+
+    cdir = change_dir(project_path, change_id)
+    report: dict[str, list[str]] = {}
+
+    contract_path = cdir / "change-contract.json"
+    contract_errors: list[str] = []
+    if not contract_path.exists():
+        contract_errors.append(f"change-contract.json missing at {contract_path}")
+    else:
+        try:
+            contract_payload = json.loads(contract_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            contract_errors.append(f"invalid JSON: {exc}")
+        else:
+            contract_errors.extend(validate_change_contract(contract_payload))
+    report["change-contract.json"] = contract_errors
+
+    delivery_path = cdir / "delivery-report.md"
+    if delivery_path.exists():
+        try:
+            delivery_text = delivery_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            report["delivery-report.md"] = [f"cannot read: {exc}"]
+        else:
+            report["delivery-report.md"] = validate_delivery_report_text(delivery_text)
+
+    # RC-4A.3.1.C: applied-change.json validation. Optional — only present
+    # post-`change run` on a `completed` outcome. When present we MUST
+    # validate the agentic.applied_change.v1 schema so the operator's "did
+    # this change actually deliver something coherent?" check is honest.
+    applied_change_path = cdir / "applied-change.json"
+    if applied_change_path.exists():
+        try:
+            applied_payload = json.loads(applied_change_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            report["applied-change.json"] = [f"cannot read / invalid JSON: {exc}"]
+        else:
+            report["applied-change.json"] = validate_applied_change(applied_payload)
+
+    ok = all(not errs for errs in report.values())
+
+    if args.json:
+        print(json.dumps({
+            "project_id": project_id,
+            "change_id": change_id,
+            "change_dir": str(cdir),
+            "ok": ok,
+            "report": report,
+        }, indent=2))
+        return
+
+    print(f"Project: {project['name']} ({project_id})")
+    print(f"Change: {change_id}")
+    print(f"Validation: {'OK' if ok else 'FAILED'}")
+    for artifact, errors in report.items():
+        marker = "[ok]" if not errors else "[FAIL]"
+        print(f"  {marker} {artifact}")
+        for err in errors:
+            print(f"    - {err}")
+    if not ok:
+        sys.exit(1)
+
+
+def cmd_change_run(args: argparse.Namespace) -> None:
+    """RC-4A.2: drive a change session through AutonomousController.
+
+    Mirrors the autonomous-start wiring (real AgenticProjectRuntime + the
+    Apply Gate) but runs exactly one task derived from the change-contract.
+    Writes `applied-change.json` + `delivery-report.md` under the change
+    dir on the way out and prints a status summary (or JSON) to stdout.
+    """
+    from orchestrator.core.change_contract import resolve_change_id
+    from orchestrator.core.change_runner import run_change
+    from orchestrator.core.run_package import apply_selected_candidate
+    from orchestrator.core.deploy import load_agentic_config
+
+    paths = _initialized_paths(args.root)
+    engine = create_engine(paths)
+    project_id = args.project or _latest_project_id(engine)
+    project = engine.require_project(project_id)
+    project_path = Path(project["path"])
+
+    try:
+        change_id = resolve_change_id(project_path, args.change_id)
+    except FileNotFoundError as exc:
+        raise SystemExit(f"error: {exc}")
+
+    runtime = AgenticProjectRuntime(engine.db)
+    agentic_config = load_agentic_config(project_path)
+
+    def _run_inner_loop(*, project: dict[str, Any], intent_overrides: dict[str, Any]) -> AgenticRunResult:
+        return runtime.run(
+            project=project,
+            intent_overrides=intent_overrides,
+            patch_worker=agentic_config.patch_worker,
+            execute_eval=(agentic_config.patch_worker == "codex"),
+            timeout_sec=agentic_config.codex.timeout_sec,
+            codex_sandbox=agentic_config.codex.sandbox,
+            codex_ask_for_approval=agentic_config.codex.ask_for_approval,
+            codex_command=agentic_config.codex.command,
+        )
+
+    def _apply(*, project_path: Path, run_dir: Path, selected_candidate: str) -> dict[str, Any]:
+        record = apply_selected_candidate(
+            project_path=project_path, run_dir=run_dir, selected_candidate=selected_candidate,
+        )
+        record["project_id"] = project["id"]
+        return record
+
+    try:
+        result = run_change(
+            project=project,
+            change_id=change_id,
+            run_inner_loop=_run_inner_loop,
+            apply_candidate=_apply,
+            allow_dirty_worktree=bool(getattr(args, "allow_dirty_worktree", False)),
+        )
+    except (RuntimeError, FileNotFoundError) as exc:
+        raise SystemExit(f"error: {exc}")
+
+    if args.json:
+        print(json.dumps({
+            "project_id": project_id,
+            "change_id": result.change_id,
+            "result": result.result,
+            "session_id": result.session_id,
+            "task_id": result.task_id,
+            "commit_sha": result.commit_sha,
+            "applied_change_json": str(result.applied_change_path) if result.applied_change_path else None,
+            "delivery_report_md": str(result.delivery_report_path),
+            "review_open_count": result.review_open_count,
+        }, indent=2))
+        if result.result != "completed":
+            sys.exit(1)
+        return
+
+    print(f"Project: {project['name']} ({project_id})")
+    print(f"Change: {result.change_id}")
+    print(f"Result: {result.result}")
+    if result.session_id:
+        print(f"Session: {result.session_id}")
+    if result.commit_sha:
+        print(f"Commit: {result.commit_sha}")
+    if result.applied_change_path:
+        print(f"Applied change: {result.applied_change_path}")
+    print(f"Delivery report: {result.delivery_report_path}")
+    if result.review_open_count:
+        print(f"Open review items: {result.review_open_count}")
+        print(f"  agent-studio autonomous reviews list --project {project_id}")
+    if result.result != "completed":
+        sys.exit(1)
 
 
 def _initialized_paths(root: str | Path | None):

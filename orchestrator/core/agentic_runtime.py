@@ -6,6 +6,7 @@ import json
 import re
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -1540,11 +1541,46 @@ def _render_patch_worker_prompt(
             f"\nCandidate strategy: `{strategy.get('label')}`\n"
             f"Strategy guidance: {strategy.get('prompt_hint')}\n"
         )
+
+    # RC-2C.1.4: closing 3 prompt gaps surfaced by the read-only review.
+    # (a) success_criteria was being silently dropped — Codex never saw
+    # the explicit acceptance bar the task-graph parser extracted from
+    # `- bullet` lines under each H2 in requirements.md.
+    success_criteria = intent.get("success_criteria") or []
+    if success_criteria:
+        success_block = (
+            "\nSuccess criteria (every item must hold after your patch):\n"
+            + "\n".join(f"  - {item}" for item in success_criteria)
+            + "\n"
+        )
+    else:
+        success_block = "\nSuccess criteria: none provided.\n"
+
+    # (b) previous_completed_tasks lets task-002 / task-003 know what
+    # task-001 already did, so the patch worker doesn't restructure or
+    # overwrite committed work. The autonomous controller is responsible
+    # for populating this field in intent_overrides; the runtime trusts
+    # whatever it receives.
+    previous_tasks = intent.get("previous_completed_tasks") or []
+    if previous_tasks:
+        prev_block = (
+            "\nPrevious completed tasks in this session "
+            "(their changes are already committed; build on them, do not undo):\n"
+            + "\n".join(
+                f"  - {t.get('id', '?')} {t.get('title', '')}  "
+                f"(commit={t.get('commit') or '?'}, run={t.get('run_id') or '?'})"
+                for t in previous_tasks
+            )
+            + "\n"
+        )
+    else:
+        prev_block = ""
+
     return f"""You are the patch-worker for Local Agent Dev Studio's agentic_project runtime.
 
 Goal:
 {intent["goal"]}
-{strategy_block}
+{success_block}{prev_block}{strategy_block}
 You must produce a real source/test/config patch in this isolated workspace.
 Do not edit .agent/**. Do not add dependencies. Do not run migrations. Do not write outside the workspace.
 
@@ -1558,7 +1594,7 @@ Required eval commands that the orchestrator will run after your patch:
 {json.dumps(required_commands, indent=2)}
 
 Make a small, bounded improvement that advances the goal and can be validated by the declared eval harness.
-Prefer touching existing apps/web source and tests over writing documentation.
+Prefer touching the source and test files listed above (or under the allowed path globs) over writing documentation.
 When done, leave files modified in the workspace and reply with a short summary of changed files.
 """
 
@@ -1568,7 +1604,6 @@ def _diff_directories(base: Path, changed: Path, allowed_paths: list[str]) -> di
     changed_files_set = set(_discover_files(changed))
     all_paths = sorted((base_files | changed_files_set) - {".DS_Store"})
     entries: list[dict[str, Any]] = []
-    diff_parts: list[str] = []
     for relative in all_paths:
         if relative.startswith(".agent/"):
             continue
@@ -1586,11 +1621,18 @@ def _diff_directories(base: Path, changed: Path, allowed_paths: list[str]) -> di
             "within_scope": _path_allowed(relative, allowed_paths),
         }
         entries.append(entry)
-        diff_parts.append(_unified_file_diff(base_path, changed_path, relative))
-    source_patch_present = bool(diff_parts) and any(item["category"] in {"source", "test", "config"} for item in entries)
+    source_patch_present = bool(entries) and any(item["category"] in {"source", "test", "config"} for item in entries)
+    # RC-3E.2: build the patch via a real `git diff` in an ephemeral repo
+    # rather than hand-serializing unified diffs via `difflib`. The prior
+    # difflib path emitted patches without `diff --git` headers / new-file
+    # mode markers / hunk-end normalization, which `git apply` rejected as
+    # `corrupt patch` once a non-trivial multi-file candidate was produced
+    # (RC-3E.2 root cause). The ephemeral-repo path yields canonical
+    # output that `git apply --check` accepts deterministically.
+    patch_diff, apply_check = _build_git_patch(base, changed, entries)
     return {
         "source_patch_present": source_patch_present,
-        "patch_diff": "\n".join(part for part in diff_parts if part).strip() + ("\n" if diff_parts else ""),
+        "patch_diff": patch_diff,
         "changed_files": {
             "schema_version": "agentic.changed_files.v1",
             "candidate": "candidate-a",
@@ -1599,8 +1641,137 @@ def _diff_directories(base: Path, changed: Path, allowed_paths: list[str]) -> di
             "changed_files": entries,
             "source_patch_present": source_patch_present,
             "out_of_scope_changes": [item for item in entries if not item["within_scope"]],
+            # RC-3E.2: result of `git apply --check patch.diff` against a
+            # clean copy of `base`. Promotion Gate consumes this via the
+            # `patch_apply_check_passed` hard gate, so a corrupt patch is
+            # rejected at promotion time rather than discovered at the
+            # Apply Gate (which previously was the first detector and
+            # blocked the run with no actionable signal upstream).
+            "patch_apply_check_passed": apply_check["passed"],
+            "patch_apply_check_stderr": apply_check["stderr"],
         },
     }
+
+
+def _build_git_patch(
+    base: Path,
+    changed: Path,
+    entries: list[dict[str, Any]],
+) -> tuple[str, dict[str, Any]]:
+    """Build a canonical `git diff` patch and self-validate it.
+
+    Returns `(patch_text, apply_check_dict)` where apply_check_dict is
+    `{"passed": bool, "stderr": str | None}`. An empty entries list
+    short-circuits to `("", {"passed": True, "stderr": None})`.
+
+    Strategy: stage `base` + `changed` projections into an ephemeral git
+    repo (NOT the real project, NOT the candidate worktree — both of
+    which have parent-repo / nested-worktree confounders), then read
+    `git diff --binary HEAD` to get a canonical patch, then run
+    `git apply --check` on the same patch in the same ephemeral repo
+    to verify it is well-formed. If `git` is unavailable or fails, fall
+    back to a marker patch and surface the failure via apply_check.
+
+    Notes on robustness:
+    - `--binary` keeps the patch deterministic for binary diffs (legacy
+      "Binary files differ" line was not git-applyable).
+    - Files are staged via `git add -A` so new/deleted files emit the
+      proper `new file mode` / `deleted file mode` headers.
+    - The candidate worktree is NEVER used as a git repo; we copy the
+      file bytes into a fresh tempdir to side-step the `.agent/worktrees/`
+      nested-repo footgun (RC-3E.2 finding: running `git diff` inside
+      a nested worktree resolved to the parent repo and produced a
+      bogus patch listing `task-graph.json`).
+    """
+    if not entries:
+        return "", {"passed": True, "stderr": None}
+    try:
+        with tempfile.TemporaryDirectory(prefix="agentic-patch-") as tmp:
+            repo = Path(tmp)
+            # 1. Stage base content. We seed the repo with EVERY file
+            #    discovered in `base` (not just the changed ones) so the
+            #    base commit is faithful and `git diff HEAD` covers
+            #    additions/deletions correctly relative to base.
+            for relative in _discover_files(base):
+                src = base / relative
+                if not src.is_file():
+                    continue
+                dst = repo / relative
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                dst.write_bytes(src.read_bytes())
+            _git(repo, ["init", "-q", "-b", "main"])
+            _git(repo, ["config", "user.email", "agentic-diff@local"])
+            _git(repo, ["config", "user.name", "agentic-diff"])
+            _git(repo, ["config", "commit.gpgsign", "false"])
+            _git(repo, ["add", "-A"])
+            _git(repo, ["commit", "-q", "--allow-empty", "-m", "base"])
+            # 2. Apply the changed projection: copy each entry's `changed`
+            #    bytes (or remove for deletes). Only touch the entries we
+            #    classified — un-changed files stay at base.
+            for entry in entries:
+                relative = str(entry["path"])
+                src_changed = changed / relative
+                dst = repo / relative
+                if entry["change_type"] == "deleted":
+                    if dst.exists():
+                        dst.unlink()
+                    continue
+                if not src_changed.is_file():
+                    # Defensive: classification said added/modified but file
+                    # missing in changed snapshot. Skip silently rather than
+                    # corrupt the patch.
+                    continue
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                dst.write_bytes(src_changed.read_bytes())
+            _git(repo, ["add", "-A"])
+            # 3. Generate canonical patch.
+            diff_proc = subprocess.run(
+                ["git", "-C", str(repo), "diff", "--binary", "--cached", "HEAD"],
+                capture_output=True, text=True, check=False, timeout=30,
+            )
+            if diff_proc.returncode != 0:
+                return (
+                    f"# patch generation failed: git diff exit {diff_proc.returncode}\n# stderr: {diff_proc.stderr.strip()}\n",
+                    {"passed": False, "stderr": diff_proc.stderr.strip() or "git diff failed"},
+                )
+            patch_text = diff_proc.stdout
+            if not patch_text:
+                # Entries existed (binary equality, mode-only, etc.), but
+                # diff is empty. Still considered well-formed.
+                return "", {"passed": True, "stderr": None}
+            # 4. Self-validate with apply --check against the BASE state
+            #    (reset to HEAD first so we're not checking against the
+            #    already-staged target).
+            _git(repo, ["reset", "-q", "--hard", "HEAD"])
+            patch_path = repo / ".agentic-patch.diff"
+            patch_path.write_bytes(patch_text.encode("utf-8"))
+            check_proc = subprocess.run(
+                ["git", "-C", str(repo), "apply", "--check", str(patch_path)],
+                capture_output=True, text=True, check=False, timeout=30,
+            )
+            apply_check = {
+                "passed": check_proc.returncode == 0,
+                "stderr": (check_proc.stderr.strip() or check_proc.stdout.strip() or None) if check_proc.returncode != 0 else None,
+            }
+            return patch_text, apply_check
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return (
+            f"# patch generation failed: {exc.__class__.__name__}: {exc}\n",
+            {"passed": False, "stderr": f"{exc.__class__.__name__}: {exc}"},
+        )
+
+
+def _git(repo: Path, args: list[str]) -> None:
+    """Run a git command in `repo`, raising on nonzero exit. Helper for
+    `_build_git_patch` only — _run_git is intentionally lenient for the
+    HEAD lookup elsewhere; this one fails loud so patch generation
+    surfaces problems via the apply_check dict path."""
+    completed = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        capture_output=True, text=True, check=False, timeout=30,
+    )
+    if completed.returncode != 0:
+        raise OSError(f"git {' '.join(args)} exited {completed.returncode}: {completed.stderr.strip()}")
 
 
 def _file_bytes(path: Path) -> bytes:
@@ -2062,12 +2233,19 @@ def _evaluate_candidate_hard_gates(
                     break
             if has_critical_security:
                 break
+    # RC-3E.2: surface the apply-check result as a hard gate. Default to
+    # True (do not punish older candidates / migration paths that pre-date
+    # this field). The patch generator (`_build_git_patch`) self-checks
+    # and stores the result on changed_files; here we just surface it.
+    apply_check_present = "patch_apply_check_passed" in changed
+    patch_apply_check_passed = bool(changed.get("patch_apply_check_passed", True)) if apply_check_present else True
     return {
         "source_patch_present": bool(score.get("source_patch_present")),
         "required_eval_executed": bool(eval_results.get("required_eval_executed")),
         "required_eval_passed": bool(eval_results.get("required_eval_passed")),
         "no_out_of_scope_changes": not bool(out_of_scope),
         "no_critical_security_finding": not has_critical_security,
+        "patch_apply_check_passed": patch_apply_check_passed,
     }
 
 
@@ -2318,6 +2496,7 @@ def _build_promotion_report(
             "required_eval_passed": score["hard_gates"]["required_eval_passed"],
             "diff_within_scope": score["hard_gates"]["no_out_of_scope_changes"],
             "no_critical_security_finding": score["hard_gates"]["no_critical_security_finding"],
+            "patch_apply_check_passed": score["hard_gates"].get("patch_apply_check_passed", True),
             "disqualified": score["disqualified"],
             "score": score["total"],
             "stop_reason": str(repair.get("stop_reason") or ""),
@@ -2390,6 +2569,14 @@ def _build_promotion_report(
     ref_repair_stop_reason = str(ref_repair.get("stop_reason") or "")
     ref_repair_abandoned = bool(ref_repair_attempts) and ref_required_eval_executed and not ref_required_eval_passed
 
+    # RC-3E.2: surface patch_apply_check at promotion-report level so the
+    # report itself records why a candidate was disqualified for a corrupt
+    # patch. Default True for older candidates whose changed_files predate
+    # the field (backward-compat with archived runs).
+    ref_patch_apply_check_passed = (
+        bool(reference_score["hard_gates"].get("patch_apply_check_passed", True))
+        if reference_score else True
+    )
     hard_gates = {
         "intent_contract_present": True,
         "context_pack_present": True,
@@ -2403,6 +2590,7 @@ def _build_promotion_report(
         "required_eval_passed": ref_required_eval_passed,
         "source_patch_present": ref_source_patch_present,
         "no_critical_security_finding": (reference_score["hard_gates"]["no_critical_security_finding"] if reference_score else True),
+        "patch_apply_check_passed": ref_patch_apply_check_passed,
     }
     gate_details = [
         _gate_detail("context_has_source_files", True, context_has_source_files, "Context pack must include source files before patch generation."),
@@ -2410,6 +2598,7 @@ def _build_promotion_report(
         _gate_detail("required_eval_declared", True, required_eval_declared, "Required eval command(s) must be declared before promotion."),
         _gate_detail("required_eval_executed", True, ref_required_eval_executed, "Required eval command(s) must execute before promotion."),
         _gate_detail("required_eval_passed", True, ref_required_eval_passed, "Required eval command(s) must pass before promotion."),
+        _gate_detail("patch_apply_check_passed", True, ref_patch_apply_check_passed, "Generated patch.diff must pass `git apply --check` against a clean copy of the base before promotion (RC-3E.2)."),
     ]
 
     # Cross-candidate diversity replaces the prior 0.0 placeholder.
@@ -3169,7 +3358,13 @@ def _discover_files(project_path: Path) -> list[str]:
         "playwright-report",
     }
     ignored_parts: set[str] = set()
+    # Tooling-generated files that are never product source. Same nature as
+    # `next-env.d.ts` (Next.js codegen): if these leak into changed-files they
+    # trip diff_within_scope hard gate even when the actual product patch is
+    # clean. *.tsbuildinfo is emitted by `tsc` whenever tsconfig has
+    # `incremental: true` (the Next.js default), including under `--noEmit`.
     ignored_file_names = {"next-env.d.ts"}
+    ignored_file_suffixes = (".tsbuildinfo",)
     files: list[str] = []
     for path in project_path.rglob("*"):
         if not path.is_file():
@@ -3178,6 +3373,8 @@ def _discover_files(project_path: Path) -> list[str]:
         if any(part in ignored_dirs for part in path.relative_to(project_path).parts):
             continue
         if path.name in ignored_file_names:
+            continue
+        if path.name.endswith(ignored_file_suffixes):
             continue
         if any(relative.startswith(prefix) for prefix in ignored_parts):
             continue

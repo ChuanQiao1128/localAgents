@@ -174,6 +174,225 @@ class AgenticRuntimeTests(unittest.TestCase):
             self.assertNotIn("apps/web/test-results/.last-run.json", changed_paths)
             self.assertNotIn("apps/web/next-env.d.ts", changed_paths)
 
+    def test_patch_generation_produces_git_applyable_patch_for_modified_file(self) -> None:
+        # RC-3E.2: prior `difflib`-based generator emitted patches without
+        # `diff --git` headers, which `git apply` rejected on multi-file
+        # candidates. Verify the new generator produces a git-applyable
+        # patch for the simplest case (single file modified).
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / "base"
+            changed = Path(tmp) / "changed"
+            (base / "backend" / "app").mkdir(parents=True)
+            (changed / "backend" / "app").mkdir(parents=True)
+            (base / "backend" / "app" / "main.py").write_text("def hello():\n    return 'hi'\n", encoding="utf-8")
+            (changed / "backend" / "app" / "main.py").write_text(
+                "def hello():\n    return 'hi'\n\ndef world():\n    return 'world'\n", encoding="utf-8"
+            )
+
+            diff = _diff_directories(base, changed, ["backend/**"])
+
+            self.assertTrue(diff["source_patch_present"])
+            self.assertTrue(diff["changed_files"]["patch_apply_check_passed"])
+            self.assertIsNone(diff["changed_files"]["patch_apply_check_stderr"])
+            self.assertIn("diff --git a/backend/app/main.py b/backend/app/main.py", diff["patch_diff"])
+
+            # Independent re-validation: stage `base` in a fresh repo and
+            # actually apply the patch. Must succeed.
+            with tempfile.TemporaryDirectory() as repo_tmp:
+                repo = Path(repo_tmp)
+                for src in base.rglob("*"):
+                    if src.is_file():
+                        rel = src.relative_to(base)
+                        (repo / rel.parent).mkdir(parents=True, exist_ok=True)
+                        (repo / rel).write_bytes(src.read_bytes())
+                subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+                subprocess.run(["git", "config", "user.email", "t@t"], cwd=repo, check=True)
+                subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+                subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+                subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "b"], cwd=repo, check=True)
+                patch_file = repo / ".p.diff"
+                patch_file.write_text(diff["patch_diff"], encoding="utf-8")
+                check = subprocess.run(
+                    ["git", "apply", "--check", str(patch_file)], cwd=repo, capture_output=True, text=True,
+                )
+                self.assertEqual(check.returncode, 0, msg=f"git apply --check failed: {check.stderr}")
+
+    def test_patch_generation_produces_git_applyable_patch_for_new_file(self) -> None:
+        # RC-3E.2: difflib didn't emit `new file mode 100644` for added
+        # files, which made `git apply` either skip or corrupt the
+        # subsequent file boundary. Verify the new path emits proper
+        # new-file headers.
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / "base"
+            changed = Path(tmp) / "changed"
+            (base / "backend" / "app").mkdir(parents=True)
+            (changed / "backend" / "app").mkdir(parents=True)
+            (base / "backend" / "app" / "main.py").write_text("# baseline\n", encoding="utf-8")
+            (changed / "backend" / "app" / "main.py").write_text("# baseline\n", encoding="utf-8")
+            (changed / "backend" / "app" / "new_module.py").write_text(
+                "def added():\n    return 1\n", encoding="utf-8"
+            )
+
+            diff = _diff_directories(base, changed, ["backend/**"])
+
+            self.assertTrue(diff["changed_files"]["patch_apply_check_passed"])
+            self.assertIn("new file mode 100644", diff["patch_diff"])
+            self.assertIn("backend/app/new_module.py", diff["patch_diff"])
+
+    def test_patch_generation_handles_multiple_files_without_hunk_corruption(self) -> None:
+        # RC-3E.2 root-cause regression: the original RC-3E task-002
+        # patch had ~9 changed files (modified processor.py + 4 new
+        # modules under backend/app/eval/ + 4 test files) and tripped
+        # `corrupt patch at line 549`. Repro the shape and assert
+        # apply-check passes.
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / "base"
+            changed = Path(tmp) / "changed"
+            (base / "backend" / "app").mkdir(parents=True)
+            (base / "backend" / "tests").mkdir(parents=True)
+            (changed / "backend" / "app" / "eval").mkdir(parents=True)
+            (changed / "backend" / "tests").mkdir(parents=True)
+            # Pre-existing modified
+            (base / "backend" / "app" / "processor.py").write_text(
+                "class Req:\n    text: str\n    tone: str\n", encoding="utf-8"
+            )
+            (changed / "backend" / "app" / "processor.py").write_text(
+                "class Req:\n    text: str\n    tone: str\n    disable_retrieval: bool = False\n", encoding="utf-8"
+            )
+            # Pre-existing test extended
+            (base / "backend" / "tests" / "test_rewrite.py").write_text(
+                "def test_existing(): assert True\n", encoding="utf-8"
+            )
+            (changed / "backend" / "tests" / "test_rewrite.py").write_text(
+                "def test_existing(): assert True\n\ndef test_disable_retrieval(): assert True\n",
+                encoding="utf-8",
+            )
+            # New eval package with 4 modules
+            for name, body in (
+                ("__init__.py", ""),
+                ("cases.py", "def load_golden_cases(p):\n    return []\n"),
+                ("metrics.py", "def score_structural(r): return True\n"),
+                ("cli.py", "def main():\n    pass\n"),
+            ):
+                (changed / "backend" / "app" / "eval" / name).write_text(body, encoding="utf-8")
+            # 3 new test files
+            for name in ("test_eval_cases.py", "test_eval_metrics.py", "test_eval_cli.py"):
+                (changed / "backend" / "tests" / name).write_text(f"def test(): assert True\n", encoding="utf-8")
+
+            diff = _diff_directories(base, changed, ["backend/**"])
+
+            self.assertTrue(diff["changed_files"]["patch_apply_check_passed"],
+                            msg=f"apply-check failed: {diff['changed_files']['patch_apply_check_stderr']}")
+            # 9 changed entries (1 modified processor + 1 modified test + 4 new eval + 3 new tests).
+            self.assertEqual(len(diff["changed_files"]["changed_files"]), 9)
+            # All entries within scope (test asserts the seed setup is sane).
+            self.assertEqual(diff["changed_files"]["out_of_scope_changes"], [])
+
+    def test_promotion_rejects_candidate_when_patch_apply_check_fails(self) -> None:
+        # RC-3E.2: a candidate whose changed_files reports
+        # patch_apply_check_passed=False MUST be disqualified by the
+        # hard-gate evaluator, even if every other gate passes.
+        candidate = {
+            "id": "candidate-a",
+            "score": {"source_patch_present": True},
+            "changed_files": {
+                "changed_files": [{"path": "backend/x.py", "category": "source", "within_scope": True}],
+                "out_of_scope_changes": [],
+                "patch_apply_check_passed": False,
+                "patch_apply_check_stderr": "error: corrupt patch at line 42",
+            },
+        }
+        eval_results = {"required_eval_executed": True, "required_eval_passed": True}
+
+        gates = _evaluate_candidate_hard_gates(candidate, eval_results)
+
+        self.assertFalse(gates["patch_apply_check_passed"])
+        self.assertTrue(gates["source_patch_present"])
+        self.assertTrue(gates["required_eval_passed"])
+        self.assertTrue(gates["no_out_of_scope_changes"])
+        # Disqualification follows: not all(hard_gates.values()) => disqualified.
+        self.assertFalse(all(gates.values()),
+                         msg="patch_apply_check_passed=False must trip disqualification")
+
+    def test_patch_generation_does_not_leak_parent_repo_diff_when_changed_is_nested(self) -> None:
+        # RC-3E.2 secondary finding: when the candidate worktree lives
+        # inside the parent project's git repo (as `.agent/worktrees/...`
+        # does in real runs), running `git diff` inside it resolves to
+        # the parent repo and produces a misleading patch (the user's
+        # manual regen attempt produced a `task-graph.json`-only diff).
+        # The runtime must NOT depend on `.agent/worktrees/` being its
+        # own git repo. This test simulates a `changed` directory that
+        # IS inside a parent git repo and verifies the produced patch
+        # only reflects the in-scope file changes, not parent-repo state.
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            parent = tmp / "parent_repo"
+            parent.mkdir()
+            (parent / "task-graph.json").write_text('{"unrelated": true}\n', encoding="utf-8")
+            subprocess.run(["git", "init", "-q", "-b", "main"], cwd=parent, check=True)
+            subprocess.run(["git", "config", "user.email", "t@t"], cwd=parent, check=True)
+            subprocess.run(["git", "config", "user.name", "t"], cwd=parent, check=True)
+            subprocess.run(["git", "add", "-A"], cwd=parent, check=True)
+            subprocess.run(["git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", "p"], cwd=parent, check=True)
+            # changed lives INSIDE the parent repo (mirrors `.agent/worktrees/...`)
+            base = tmp / "base"
+            changed = parent / "candidate"
+            base.mkdir()
+            changed.mkdir()
+            (base / "backend").mkdir()
+            (changed / "backend").mkdir()
+            (base / "backend" / "x.py").write_text("v = 1\n", encoding="utf-8")
+            (changed / "backend" / "x.py").write_text("v = 2\n", encoding="utf-8")
+
+            diff = _diff_directories(base, changed, ["backend/**"])
+
+            self.assertTrue(diff["changed_files"]["patch_apply_check_passed"])
+            # Critical: the patch must NOT mention task-graph.json (parent repo state)
+            self.assertNotIn("task-graph.json", diff["patch_diff"])
+            self.assertIn("backend/x.py", diff["patch_diff"])
+
+    def test_diff_directories_ignores_tsbuildinfo_so_it_never_trips_scope_gate(self) -> None:
+        # Repro of RC-3A.7: TypeScript with `incremental: true` (the Next.js
+        # default) emits `tsconfig.tsbuildinfo` even under `npm run typecheck`
+        # / `npm run build`. Pre-fix, this leaked into changed-files as
+        # category=source with within_scope=False (because the dogfood scope
+        # was `app/page.tsx, app/**, components/**` — the buildinfo lives at
+        # project root) and tripped Promotion Gate's diff_within_scope hard
+        # rule, routing a clean Codex patch to needs-human-review.
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp) / "base"
+            changed = Path(tmp) / "changed"
+            (base / "app").mkdir(parents=True)
+            (changed / "app").mkdir(parents=True)
+            (base / "app/page.tsx").write_text(
+                "export default function Page() { return null }\n", encoding="utf-8"
+            )
+            (changed / "app/page.tsx").write_text(
+                "export default function Page() { return <main>Hero</main> }\n",
+                encoding="utf-8",
+            )
+            # Only the changed worktree has the buildinfo (TS just compiled there).
+            (changed / "tsconfig.tsbuildinfo").write_text(
+                '{"fileNames":[],"version":"5.7.3"}\n', encoding="utf-8"
+            )
+            # Custom basename also covered — buildInfoFile config can rename it.
+            (changed / "app/custom.tsbuildinfo").write_text("{}\n", encoding="utf-8")
+
+            diff = _diff_directories(
+                base, changed, ["app/page.tsx", "app/**", "components/**"]
+            )
+
+            changed_paths = [item["path"] for item in diff["changed_files"]["changed_files"]]
+            self.assertNotIn("tsconfig.tsbuildinfo", changed_paths)
+            self.assertNotIn("app/custom.tsbuildinfo", changed_paths)
+            # The clean patch must still be visible and within scope.
+            self.assertIn("app/page.tsx", changed_paths)
+            self.assertEqual(diff["changed_files"]["out_of_scope_changes"], [])
+
     def test_eval_failure_classification_separates_type_and_environment_errors(self) -> None:
         type_failure = {
             "commands": [

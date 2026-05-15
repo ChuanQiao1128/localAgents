@@ -97,6 +97,97 @@ class ParserTests(unittest.TestCase):
         graph = parse_requirements_md("## task\n\nIntent\n\nScope: src/api/**, tests/api/**\n", Path("/tmp"))
         self.assertEqual(graph["tasks"][0]["scope_paths"], ["src/api/**", "tests/api/**"])
 
+    def test_scope_strips_wrapping_backticks(self) -> None:
+        """RC-4C.1.A regression: writers naturally write ``Scope: `app/**` ``
+        because backticks render as code in markdown previewers. Pre-fix the
+        parser captured the backticks literally and `fnmatch("app/page.tsx",
+        "`app/**`")` returned False, making the Promotion Gate's
+        diff_within_scope check fail on every patched file. The first real
+        Codex run on RC-4B (run_0f41f8b7ee on ai-writing-quality-editor)
+        surfaced this bug — the parser MUST strip wrapping backticks."""
+        graph = parse_requirements_md(
+            "## task\n\nIntent\n\nScope: `app/**`, `components/**`\n",
+            Path("/tmp"),
+        )
+        self.assertEqual(graph["tasks"][0]["scope_paths"], ["app/**", "components/**"])
+
+    def test_scope_strips_wrapping_backticks_single_value(self) -> None:
+        graph = parse_requirements_md(
+            "## task\n\nIntent\n\nScope: `app/**`\n",
+            Path("/tmp"),
+        )
+        self.assertEqual(graph["tasks"][0]["scope_paths"], ["app/**"])
+
+    def test_scope_multiline_bullet_form(self) -> None:
+        """RC-4C.1.A: a `Scope:` line with no inline value opens a multi-line
+        bullet block. Cleaner for writers than comma-separated, and what
+        Chuan asked for explicitly in RC-4C.1.B."""
+        md = (
+            "## task\n\nIntent\n\n"
+            "Scope:\n"
+            "- app/**\n"
+            "- components/**\n"
+            "- lib/**\n"
+        )
+        graph = parse_requirements_md(md, Path("/tmp"))
+        self.assertEqual(
+            graph["tasks"][0]["scope_paths"],
+            ["app/**", "components/**", "lib/**"],
+        )
+
+    def test_scope_multiline_bullets_with_backticks_also_cleaned(self) -> None:
+        """Defense in depth: bullets inside a multi-line Scope block also
+        get backtick-stripped, in case the writer mixes both habits."""
+        md = (
+            "## task\n\nIntent\n\n"
+            "Scope:\n"
+            "- `app/**`\n"
+            "- `components/**`\n"
+        )
+        graph = parse_requirements_md(md, Path("/tmp"))
+        self.assertEqual(
+            graph["tasks"][0]["scope_paths"],
+            ["app/**", "components/**"],
+        )
+
+    def test_scope_multiline_block_closes_on_next_meta_line(self) -> None:
+        """Multi-line Scope block must close when the next non-bullet line
+        appears (Risk:, prose, another `Foo:` line). Otherwise unrelated
+        bullets later in the section would leak into scope_paths."""
+        md = (
+            "## task\n\nIntent\n\n"
+            "Scope:\n"
+            "- app/**\n"
+            "\n"
+            "Risk: low\n"
+            "\n"
+            "Acceptance:\n"
+            "- the build passes\n"
+        )
+        graph = parse_requirements_md(md, Path("/tmp"))
+        task = graph["tasks"][0]
+        self.assertEqual(task["scope_paths"], ["app/**"])
+        self.assertEqual(task["risk"], "low")
+        self.assertEqual(task["acceptance_criteria"], ["the build passes"])
+
+    def test_acceptance_multiline_bullet_block(self) -> None:
+        """`Acceptance:` opener supports the same bullet-block form so
+        writers can pick either inline or block form per metadata field."""
+        md = (
+            "## task\n\nIntent\n\n"
+            "Scope:\n"
+            "- app/**\n"
+            "\n"
+            "Acceptance:\n"
+            "- first thing passes\n"
+            "- second thing passes\n"
+        )
+        graph = parse_requirements_md(md, Path("/tmp"))
+        self.assertEqual(
+            graph["tasks"][0]["acceptance_criteria"],
+            ["first thing passes", "second thing passes"],
+        )
+
     def test_risk_parsed_low_medium_high(self) -> None:
         md = (
             "## low\n\nIntent\n\nRisk: low\n\n"

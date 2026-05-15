@@ -139,6 +139,140 @@ def validate_task_graph(payload: dict[str, Any]) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# RC-4A.1: change-mode artifacts
+# ---------------------------------------------------------------------------
+def validate_change_contract(payload: dict[str, Any]) -> list[str]:
+    """Validate `.agent/changes/<change_id>/change-contract.json` payload.
+
+    Required: schema_version=agentic.change_contract.v1, change_id,
+    source_change_request_path, goal, scope_paths (list, may be empty),
+    scope_missing (bool), non_goals (list), acceptance (non-empty list),
+    created_at.
+    """
+    if not isinstance(payload, dict):
+        return ["change-contract payload is not a dict"]
+    errors: list[str] = []
+    schema = payload.get("schema_version")
+    if schema != "agentic.change_contract.v1":
+        errors.append(f"schema_version is `{schema}`; expected `agentic.change_contract.v1`")
+    errors += _check_keys(payload, [
+        ("change_id", str),
+        ("source_change_request_path", str),
+        ("goal", str),
+        ("scope_paths", list),
+        ("scope_missing", bool),
+        ("non_goals", list),
+        ("acceptance", list),
+        ("created_at", str),
+    ], label="change-contract")
+    if isinstance(payload.get("goal"), str) and not payload["goal"].strip():
+        errors.append("change-contract.goal is empty")
+    if isinstance(payload.get("acceptance"), list) and not payload["acceptance"]:
+        errors.append("change-contract.acceptance is empty (at least one criterion required)")
+    return errors
+
+
+def validate_delivery_report_text(text: str) -> list[str]:
+    """Minimal sanity check on a delivery-report.md file.
+
+    Confirms the load-bearing markdown sections are present so a
+    regressed renderer is caught early. NOT a content validator —
+    operator review is still expected.
+    """
+    errors: list[str] = []
+    if not isinstance(text, str) or not text.strip():
+        return ["delivery-report.md is empty"]
+    required_sections = (
+        "# Change Delivery Report",
+        "## Goal",
+        "## Result",
+        "## What was changed",
+        "## Validation",
+        "## Commit",
+    )
+    for marker in required_sections:
+        if marker not in text:
+            errors.append(f"delivery-report.md missing section marker: `{marker}`")
+    return errors
+
+
+def validate_applied_change(payload: dict[str, Any]) -> list[str]:
+    """Validate an `applied-change.json` payload (RC-4A.2).
+
+    Required: schema_version=agentic.applied_change.v1, change_id,
+    candidate, run_id, base_commit, applied_to_commit, files_touched
+    (list[str]), applied_at, commit (dict with branch+sha+message),
+    promotion_decision, source_change_request.
+
+    The validator mirrors `validate_applied_candidate`'s shape — load-
+    bearing fields are required, optional ones are type-checked when
+    present. A token-leak heuristic flags JWT-like / 40+-hex strings
+    that look like secrets accidentally captured in commit metadata.
+    """
+    if not isinstance(payload, dict):
+        return ["applied-change payload is not a dict"]
+    errors: list[str] = []
+    schema = payload.get("schema_version")
+    if schema != "agentic.applied_change.v1":
+        errors.append(
+            f"applied-change.schema_version is `{schema}`; expected `agentic.applied_change.v1`"
+        )
+    errors += _check_keys(payload, [
+        ("change_id", str),
+        ("candidate", str),
+        ("run_id", str),
+        ("base_commit", str),
+        ("applied_to_commit", str),
+        ("files_touched", list),
+        ("applied_at", str),
+        ("commit", dict),
+        ("promotion_decision", str),
+        ("source_change_request", str),
+    ], label="applied-change")
+    files = payload.get("files_touched")
+    if isinstance(files, list):
+        for index, item in enumerate(files):
+            if not isinstance(item, str):
+                errors.append(
+                    f"applied-change.files_touched[{index}] is `{type(item).__name__}`; expected str"
+                )
+    commit = payload.get("commit")
+    if isinstance(commit, dict):
+        for key, expected in (("branch", str), ("sha", str), ("message", str)):
+            if key not in commit:
+                errors.append(f"applied-change.commit.{key} is missing")
+            elif not isinstance(commit[key], expected):
+                actual = type(commit[key]).__name__
+                errors.append(
+                    f"applied-change.commit.{key} is `{actual}`; expected `{expected.__name__}`"
+                )
+    if isinstance(payload.get("change_id"), str) and not payload["change_id"].strip():
+        errors.append("applied-change.change_id is empty")
+    import re
+    token_re = re.compile(r"\b(?:[A-Za-z0-9_-]{32,}\.[A-Za-z0-9_-]{32,}|[a-f0-9]{40,})\b")
+    serialized = json.dumps(payload, ensure_ascii=False)
+    # `applied_to_commit` is a short SHA (7 chars) so it never trips the
+    # 40+-hex heuristic. A full SHA in `commit.message` or elsewhere is
+    # legitimate — whitelist anything that matches the commit SHA fields.
+    whitelisted: set[str] = set()
+    if isinstance(commit, dict):
+        for v in (commit.get("sha"), commit.get("branch")):
+            if isinstance(v, str):
+                whitelisted.add(v)
+    for v in (payload.get("base_commit"), payload.get("applied_to_commit")):
+        if isinstance(v, str):
+            whitelisted.add(v)
+    for hit in token_re.finditer(serialized):
+        if hit.group(0) in whitelisted:
+            continue
+        errors.append(
+            "applied-change contains a value that looks like an unredacted secret"
+        )
+        break
+    return errors
+
+
+# ---------------------------------------------------------------------------
 # promotion-report.json (delegates to the v2 validator that lives in
 # agentic_runtime.py, so this module stays the single read entry point)
 # ---------------------------------------------------------------------------

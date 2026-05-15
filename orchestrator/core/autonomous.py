@@ -230,8 +230,22 @@ def _detect_repo_metadata(project_path: Path) -> dict[str, Any]:
 _TASK_HEADER_RE = re.compile(r"^(#+)\s+(.*?)\s*$")
 _BULLET_RE = re.compile(r"^\s*[-*]\s+(.*?)\s*$")
 _DEPENDS_RE = re.compile(r"^\s*Depends:\s*(.+)$", re.IGNORECASE)
-_SCOPE_RE = re.compile(r"^\s*Scope:\s*(.+)$", re.IGNORECASE)
+_SCOPE_RE = re.compile(r"^\s*Scope:\s*(.*)$", re.IGNORECASE)
 _RISK_RE = re.compile(r"^\s*Risk:\s*(low|medium|high)\s*$", re.IGNORECASE)
+
+
+def _clean_meta_value(raw: str) -> str:
+    """Strip wrapping markdown decoration (backticks, double-quotes) from a
+    meta-line value. RC-4C.1: writers tend to use ``Scope: `app/**` `` because
+    backticks read as code in markdown previewers, but the parser used to
+    capture the backticks literally and break fnmatch (`fnmatch.fnmatch(
+    "app/page.tsx", "`app/**`") → False`). This helper normalizes the
+    value back to a clean glob the Apply Gate can match.
+    """
+    value = raw.strip()
+    while len(value) >= 2 and value[0] == value[-1] and value[0] in {"`", '"'}:
+        value = value[1:-1].strip()
+    return value
 
 
 def parse_requirements_md(md_text: str, project_path: Path) -> dict[str, Any]:
@@ -290,26 +304,68 @@ def parse_requirements_md(md_text: str, project_path: Path) -> dict[str, Any]:
         scope: list[str] = []
         risk = "medium"
         intent_lines: list[str] = []
+        # RC-4C.1: a `Scope:` line with no inline value (e.g. just `Scope:`)
+        # opens a multi-line bullet block; subsequent `- foo` / `* foo`
+        # lines until the next non-bullet, non-blank line populate scope.
+        # Same shape supported for `Acceptance:` so writers can pick the
+        # form they prefer. `scope_open` / `acceptance_open` track whether
+        # we're inside an open block.
+        scope_open = False
+        acceptance_open = False
         for raw in body_lines:
             depends_match = _DEPENDS_RE.match(raw)
             if depends_match:
                 deps_raw = [d.strip() for d in depends_match.group(1).split(",") if d.strip()]
-                depends = deps_raw
+                depends = [_clean_meta_value(d) for d in deps_raw if _clean_meta_value(d)]
+                scope_open = False
+                acceptance_open = False
                 continue
             scope_match = _SCOPE_RE.match(raw)
             if scope_match:
-                scope = [s.strip() for s in scope_match.group(1).split(",") if s.strip()]
+                inline = scope_match.group(1).strip()
+                if inline:
+                    scope = [
+                        _clean_meta_value(s)
+                        for s in inline.split(",")
+                        if _clean_meta_value(s)
+                    ]
+                    scope_open = False
+                else:
+                    # `Scope:` alone — open a multi-line bullet block.
+                    scope_open = True
+                acceptance_open = False
                 continue
             risk_match = _RISK_RE.match(raw)
             if risk_match:
                 risk = risk_match.group(1).lower()
+                scope_open = False
+                acceptance_open = False
+                continue
+            # Detect `Acceptance:` opener so writers can use the same
+            # multi-line bullet form for acceptance criteria.
+            stripped = raw.strip()
+            if stripped.lower() in {"acceptance:", "acceptance criteria:"}:
+                acceptance_open = True
+                scope_open = False
                 continue
             bullet_match = _BULLET_RE.match(raw)
             if bullet_match:
-                acceptance.append(bullet_match.group(1).strip())
+                value = _clean_meta_value(bullet_match.group(1))
+                if scope_open:
+                    if value:
+                        scope.append(value)
+                    continue
+                # Bullet inside an open Acceptance block, OR a free-floating
+                # bullet (default acceptance criterion behavior). Both append
+                # to acceptance_criteria.
+                if value:
+                    acceptance.append(value)
                 continue
-            if raw.strip():
-                intent_lines.append(raw.strip())
+            # Any non-blank non-bullet line closes any open multi-line block.
+            if stripped:
+                scope_open = False
+                acceptance_open = False
+                intent_lines.append(stripped)
         # Resolve dependency references: allow task title or task-id form.
         resolved_deps: list[str] = []
         for dep in depends:
@@ -825,6 +881,19 @@ def commit_task(
             body_lines.append(f"Human-Review-Decision: {human_review_decision}")
         if human_review_override:
             body_lines.append("Human-Review-Override: true")
+    # RC-4A.2: change-mode trailers. When the task carries a `change_id` (i.e.
+    # was synthesized by `change_runner.build_change_task_graph`), emit
+    # `Change-Id:` and (when available) `Source-Change-Request:` so the
+    # commit's audit trail is self-explanatory: a future operator can grep
+    # `git log --grep Change-Id` to find every commit a change session
+    # produced. Normal autonomous-mode tasks set neither field, so this
+    # block is a no-op for them.
+    change_id_trailer = task.get("change_id")
+    if change_id_trailer:
+        body_lines.append(f"Change-Id: {change_id_trailer}")
+        source_request = task.get("source_change_request")
+        if source_request:
+            body_lines.append(f"Source-Change-Request: {source_request}")
     body = "\n".join(body_lines) + "\n"
     _git(project_path, "-c", "commit.gpgsign=false", "commit", "-m", body, "--no-verify")
     head = _git(project_path, "rev-parse", "--short", "HEAD").stdout.strip()
@@ -1233,19 +1302,31 @@ class AutonomousController:
         # the next_task=None path through `_maybe_continue_or_complete`.
         if session.status in {"completed", "paused"}:
             return None
-        budget_breach = self._check_budgets(session)
-        if budget_breach:
-            self._pause(session, reason=f"budget:{budget_breach}")
-            return None
         if session.halt_requested:
             self._pause(session, reason="halt_requested")
             return None
 
+        # RC-2C.1.2: peek at next_task BEFORE the budget check. If no
+        # eligible task remains (every task already completed or
+        # blocked), the right next step is finalization
+        # (_maybe_continue_or_complete → integration → deploy → smoke
+        # → _complete), NOT pausing on a budget that's only meaningful
+        # WHILE we're still trying to advance new tasks.
+        #
+        # Pre-fix: a session that finished 3/3 tasks could pause with
+        # `budget:max_tasks_per_session` on a subsequent
+        # `autonomous resume`, overwriting any deploy/smoke pause
+        # reason and confusing the operator (real bug surfaced in
+        # RC-2C against session_b82c6d6a3c).
         task = self.next_task(task_graph)
         if task is None:
             # Unify with _maybe_continue_or_complete so the session-end
             # hooks (final integration + deploy) run on this path too.
             self._maybe_continue_or_complete(session, task_graph)
+            return None
+        budget_breach = self._check_budgets(session)
+        if budget_breach:
+            self._pause(session, reason=f"budget:{budget_breach}")
             return None
 
         session.current_task_id = task["id"]
@@ -1265,9 +1346,32 @@ class AutonomousController:
                 "source_failure_type": task.get("source_failure_type"),
             })
 
+        # RC-2C.1.4: surface predecessor commits so the patch worker
+        # knows what task-001 / task-002 already shipped and won't undo
+        # them while implementing task-003. We pull from the live
+        # task_graph (status=completed && commit set), excluding the
+        # current task itself. Cap at 8 entries to keep the prompt
+        # bounded.
+        previous_completed: list[dict[str, Any]] = []
+        for prior in task_graph.get("tasks") or []:
+            if prior.get("id") == task.get("id"):
+                continue
+            if prior.get("status") != "completed":
+                continue
+            if not prior.get("commit"):
+                continue
+            previous_completed.append({
+                "id": prior.get("id"),
+                "title": prior.get("title"),
+                "commit": prior.get("commit"),
+                "run_id": (prior.get("run_ids") or [None])[-1],
+            })
+        previous_completed = previous_completed[-8:]
+
         intent_overrides = {
             "goal": task["intent"],
             "success_criteria": list(task.get("acceptance_criteria") or []),
+            "previous_completed_tasks": previous_completed,
             "allowed_change_scope": {
                 "paths": list(task.get("scope_paths") or []),
                 "max_files": 24,
