@@ -2,6 +2,28 @@
 
 > **AI-native software delivery runtime.** You write a `requirements.md` (or a `change-request.md` for an existing project). It drives a real Codex agent through a deterministic pipeline — decompose, generate patches, score against 12 hard rules, apply through 10 more, real `git commit`, schema-validated evidence trail. **3 of 3 demos green** end-to-end on real Codex. No black box.
 
+## Why this exists (vs. just using Claude Code or Codex directly)
+
+Codex (and Claude Code) can write code. They're real coding agents. **Local Agent Dev Studio uses Codex as its patch worker** — the model is what types. Studio is the **runtime around it**: requirements → task graph → context pack → eval harness → Promotion Gate → Apply Gate → real `git commit` → schema-validated `applied-change.json` + `delivery-report.md`.
+
+The line that explains this in one sentence:
+
+> **The model is not the system. The delivery loop is the system.**
+
+If you let a coding agent run unattended for hours, you usually get "a pile of code changes plus a model summary." That's fine for one-off help; it's not enough for delivery. Studio answers the questions a reviewer (or a future you) actually needs answered:
+
+- Which files changed? (`changed-files.json`)
+- Were any of them outside scope? (Promotion Gate `diff_within_scope`)
+- Did the build and typecheck pass on the patched tree? (`eval-results.json`)
+- Did the patch apply cleanly against the right base commit? (Apply Gate `git apply --check`)
+- Did the agent silently edit `package.json` or add a dependency? (out-of-scope refusal)
+- Which commit corresponds to which task / change? (`Agent-Task-ID` / `Change-Id` git trailers)
+- If something breaks later, how do I trace which task introduced it? (`promotion-report.json` per run)
+- For a follow-up change request, where's the contract / scope / acceptance? (`change-contract.json`)
+- For an interview or audit, where's the evidence? (`docs/EVALUATION.md` + the on-disk artifact trail)
+
+Studio's value is **controlled autonomy with full evidence**, not "AI writes more code." `Claude/Codex = patch worker; Studio = delivery runtime.`
+
 ## What this is
 
 Most "AI coding agents" today are either in-IDE copilots that leave the operator to accept every diff, or end-to-end auto-shippers that produce something live but un-reviewable. Local Agent Dev Studio sits in the middle: **autonomous enough to drive multi-task delivery without a human in the loop, but every decision is gated by deterministic Python rules and every artifact is schema-validated** — a reviewer can `git log --grep "Change-Id:"` and reconstruct exactly what happened and why.

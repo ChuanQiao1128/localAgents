@@ -42,7 +42,8 @@ Each bullet is **evidence-grounded** — every claim points back to an artifact 
 
 ## Single-line variants (for résumé skill list / project tagline)
 
-- **Local Agent Dev Studio** — AI-native software delivery runtime; deterministic gates + real Codex; 3/3 green on a 3-vertical demo matrix.
+- **Local Agent Dev Studio** — AI-native software delivery runtime; **Codex is the patch worker, Studio is the runtime**; deterministic gates + complete evidence trail; 3/3 green on a 3-vertical demo matrix.
+- **Local Agent Dev Studio** — *The model is not the system. The delivery loop is the system.* 12-rule Promotion + 10-rule Apply Gate around a real Codex agent; 12 real-Codex commits across a 3-demo matrix.
 - **Local Agent Dev Studio** — Built a Codex-driven autonomous coding agent with 12-rule Promotion + 10-rule Apply Gate; verified end-to-end on 3 different Next.js demos.
 - **Local Agent Dev Studio** — Local-first AI delivery system that turns `requirements.md` into verified git commits with full schema-validated audit trail.
 
@@ -77,4 +78,4 @@ Each bullet is **evidence-grounded** — every claim points back to an artifact 
 
 ## Recruiter-friendly elevator (1 sentence)
 
-> "Built Local Agent Dev Studio, a local-first AI-native software delivery runtime — turns markdown intents into verified git commits via deterministic 12-rule Promotion + 10-rule Apply Gates around a real Codex agent; verified end-to-end on a 3-vertical Next.js demo matrix (3 of 3 green, 12 real-Codex commits, 0 open reviews)."
+> "Built Local Agent Dev Studio, a local-first AI-native software delivery runtime — Codex is the patch worker, Studio is the runtime around it (requirements → task graph → context pack → 12-rule Promotion Gate → 10-rule Apply Gate → real `git commit` → schema-validated evidence trail). Verified end-to-end on a 3-vertical Next.js demo matrix (3 of 3 green, 12 real-Codex commits, 0 open reviews). **The model is not the system. The delivery loop is the system.**"

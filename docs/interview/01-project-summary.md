@@ -98,9 +98,15 @@ Every load-bearing artifact has a schema validator in `orchestrator/core/artifac
 
 ## Likely interview questions
 
-### Q1. "Isn't this just Cursor / GitHub Copilot Workspace / Devin?"
+### Q1. "Why not just use Claude Code or Codex directly? They can run for hours."
 
-No — those are either copilots (Cursor) or end-to-end auto-shippers (Devin). Local Agent Dev Studio sits at a different point: **deterministic gates + complete evidence trail**. Every decision is checked by 12+10 hard rules a human can audit, and every artifact is schema-validated. The point isn't "AI does everything" — it's "AI does the keystrokes; deterministic Python decides what's safe to land."
+I do use Codex — as the **patch worker**. Studio is the **runtime around it**: requirements → task graph → context pack → eval harness → Promotion Gate → Apply Gate → real `git commit` → schema-validated `applied-change.json` + `delivery-report.md`. The goal isn't to replace coding agents; it's to make their output controlled, auditable, repeatable.
+
+**The model is not the system. The delivery loop is the system.**
+
+If you let Codex run for hours unattended you get a pile of code changes plus a model summary. With Studio you get a task graph, a per-candidate run package, `changed-files.json`, `eval-results.json`, `promotion-report.json` with the gate breakdown, `applied-change.json`, `delivery-report.md`, and real git commits with `Agent-Task-ID` / `Change-Id` trailers `git log --grep`-able forever.
+
+Cursor (copilot — accept every diff) and Devin (end-to-end auto — un-reviewable result) are different points on the spectrum. Studio is **deterministic gates + complete evidence trail**.
 
 ### Q2. "What happens when Codex produces something wrong?"
 

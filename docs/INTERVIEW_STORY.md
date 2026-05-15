@@ -52,7 +52,17 @@ This version covers: positioning, the two-modes pattern, the three-demo proof, a
 
 ## Anticipated questions
 
-### Q1. "Isn't this just Cursor / GitHub Copilot Workspace / Devin?"
+### Q1. "Why not just use Claude Code / Codex directly? They can run for hours and build whole projects."
+
+> "I do use Codex as the patch worker. The difference is that Local Agent Studio wraps it in a software delivery runtime. It turns requirements into task graphs, builds context packs, runs required validation, applies Promotion and Apply Gates, records artifacts, creates commits, and produces delivery reports. The goal is not to replace coding agents — it's to make their output controlled, auditable, and repeatable.
+>
+> Concretely: if you let Codex run unattended for hours you get a pile of code changes plus a model summary. With Studio you get a task graph, a per-candidate run package, a `changed-files.json`, an `eval-results.json`, a `promotion-report.json` with the gate breakdown, an `applied-change.json`, a `delivery-report.md`, and real git commits with `Agent-Task-ID` / `Change-Id` trailers you can `git log --grep` forever. **The model is not the system. The delivery loop is the system.**"
+
+中文版:
+
+> "我确实把 Codex 作为 patch worker 使用。区别是 Local Agent Studio 在外层加了一个软件交付运行时:把需求变成任务图,构建上下文,运行验证,通过 Promotion Gate 和 Apply Gate,记录 artifacts,创建 commit,并生成交付报告。我的目标不是替代 coding agent,而是让 coding agent 的输出可控、可审计、可重复。**模型不是系统,交付闭环才是系统。**"
+
+### Q1.5 "Isn't this just Cursor / GitHub Copilot Workspace / Devin?"
 
 > "Different point on the spectrum. Cursor is a copilot — you accept every suggestion. Devin is end-to-end auto — you can't review what happened. Local Agent Dev Studio is **deterministic gates plus complete evidence trail**. Every gate decision is checkable in real Python. Every artifact validates against a schema. The point isn't 'AI does everything' — it's 'AI does the keystrokes; deterministic logic decides what's safe to land.'"
 
@@ -101,6 +111,14 @@ Pull up [`docs/interview/03-failure-cases.md`](interview/03-failure-cases.md). W
 ### Q12. "What's the most surprising thing you learned?"
 
 > "The first real-Codex run on Demo 1 paused on a parser bug, not a Codex bug. **Real-world dogfood is non-negotiable.** The unit suite was 100% green; the integration was wrong. Every milestone in this project shipped at least one bug that only surfaced once the actual flow ran on a real project. Plan for it; budget time for it; treat the failure-case catalog as the strongest evidence the system works."
+
+### Q13. "Why not just let Codex run for 24 hours unattended and see what it builds?"
+
+> "Two reasons. First, who decides when it stops? Who decides whether it's done? Who decides if it went out of scope? Who decides if a deploy should happen? Studio answers each of those with a deterministic rule (budget caps, Apply Gate, Promotion Gate, deploy.enabled config). Second, what do you do with what it built? Twenty-four hours of unsupervised Codex usually leaves a tree state nobody can audit — no per-task commits, no scope evidence, no validation log. Studio's design point is **controlled overnight autonomy**: drive multiple tasks unattended, but stop at any of {gate failure, scope violation, security-sensitive change, missing API key, deploy decision, cost budget breach}. That's a more honest answer to 'can the agent run overnight?' than 'yes, just give it time.'"
+
+### Q14. "What's the difference between 'using a model' and 'building a system around a model'?"
+
+> "**The model is not the system. The delivery loop is the system.** A model writes code; a system decides what code is allowed to land, records why, and gives a reviewer everything they need to second-guess the decision. Studio is the loop: requirements ingestion, task decomposition, scope binding, candidate generation, eval execution, deterministic gates, real `git apply`, schema-validated artifacts, human-in-the-loop review queue, change-mode delivery report. Codex is one component of that loop — the patch worker. Replacing Codex with another agent (Claude, a future Codex, even a fine-tuned model) is a clean diff against `codex_patch_worker.py`. Replacing the loop with a different orchestration is a different project."
 
 ---
 
