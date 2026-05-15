@@ -1,0 +1,23 @@
+{
+  "name": "ai-usage-cost-planner",
+  "version": "0.0.1",
+  "private": true,
+  "description": "RC-4B demo 2 — AI usage & cost planner with deterministic price math.",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "next": "15.5.18",
+    "react": "19.0.0",
+    "react-dom": "19.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "22.10.10",
+    "@types/react": "19.0.7",
+    "@types/react-dom": "19.0.3",
+    "typescript": "5.7.3"
+  }
+}
