@@ -301,6 +301,31 @@ class CandidateBudgetPropagationTests(unittest.TestCase):
             session = controller.start_or_resume()
             self.assertEqual(session.budgets.get("max_candidates_per_task"), 1)
 
+    def test_change_run_translates_yaml_budgets_to_runtime_kwargs(self) -> None:
+        # Change mode does not create an AutonomousSession; it must translate
+        # agent-studio.yaml autonomous.budgets directly into runtime.run kwargs.
+        from orchestrator.cli import _agentic_runtime_budget_kwargs_from_overrides
+
+        self.assertEqual(
+            _agentic_runtime_budget_kwargs_from_overrides(
+                {
+                    "max_candidates_per_task": 1,
+                    "max_repair_attempts_per_candidate": 1,
+                }
+            ),
+            {"candidate_count": 1, "max_repair_loops": 1},
+        )
+
+    def test_change_run_ignores_invalid_candidate_budget(self) -> None:
+        from orchestrator.cli import _agentic_runtime_budget_kwargs_from_overrides
+
+        self.assertEqual(
+            _agentic_runtime_budget_kwargs_from_overrides(
+                {"max_candidates_per_task": 0, "max_repair_attempts_per_candidate": 0}
+            ),
+            {"max_repair_loops": 0},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

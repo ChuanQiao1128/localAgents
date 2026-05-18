@@ -55,6 +55,7 @@ from orchestrator.core.run_package import (
     RunPackage,
     iter_candidate_summaries,
 )
+from orchestrator.core.product_review import run_product_review
 from orchestrator.core.cost_tracker import CostTracker
 from orchestrator.core.event_bus import EventBus
 from orchestrator.core.run_manager import create_engine
@@ -830,6 +831,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     change_run.set_defaults(handler=cmd_change_run)
 
+    product_review = subcommands.add_parser(
+        "product-review",
+        help="Run deterministic product review and write review artifacts.",
+    )
+    product_review.add_argument("--project", default=None, help="Project id. Defaults to latest project.")
+    product_review.add_argument("--json", action="store_true", help="Print raw JSON result.")
+    product_review.set_defaults(handler=cmd_product_review)
+
     workflows_parser = subcommands.add_parser("workflows", help="List workflow configs.")
     workflows_parser.set_defaults(handler=cmd_workflows)
 
@@ -1407,6 +1416,55 @@ def cmd_prd_build_review(args: argparse.Namespace) -> None:
         print("Blockers:")
         for blocker in evaluation.blockers:
             print(f"- {blocker}")
+
+
+def cmd_product_review(args: argparse.Namespace) -> None:
+    paths = _initialized_paths(args.root)
+    engine = create_engine(paths)
+    project_id = args.project or _latest_project_id(engine)
+    project = engine.require_project(project_id)
+    result = run_product_review(
+        Path(project["path"]),
+        project_id=project["id"],
+        project_name=project["name"],
+    )
+    payload = {
+        "schema_version": result.schema_version,
+        "project_id": result.project_id,
+        "project_name": result.project_name,
+        "review_id": result.review_id,
+        "score": result.score,
+        "max_score": result.max_score,
+        "verdict": result.verdict,
+        "summary": result.summary,
+        "findings": [
+            {
+                "id": finding.id,
+                "severity": finding.severity,
+                "status": finding.status,
+                "title": finding.title,
+                "evidence": finding.evidence,
+                "recommendation": finding.recommendation,
+                "generatedChangeId": finding.generatedChangeId,
+            }
+            for finding in result.findings
+        ],
+        "inputs_read": result.inputs_read,
+        "artifacts": result.artifacts,
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2))
+        return
+    print(f"Product review: {result.score}/{result.max_score}")
+    print(f"Verdict: {result.verdict}")
+    print(result.summary)
+    print(f"Review: {result.artifacts['review_md']}")
+    print(f"Review JSON: {result.artifacts['review_json']}")
+    print(f"Change plan: {result.artifacts['change_plan_md']}")
+    if result.findings:
+        print("Findings:")
+        for finding in result.findings:
+            print(f"- [{finding.severity}] {finding.id}: {finding.title}")
 
 
 def cmd_design_draft(args: argparse.Namespace) -> None:
@@ -4026,6 +4084,24 @@ def cmd_change_validate(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
+def _agentic_runtime_budget_kwargs_from_overrides(budgets: dict[str, Any]) -> dict[str, int]:
+    """Translate agent-studio.yaml autonomous budget knobs into runtime args.
+
+    Change mode does not create an AutonomousSession, so it must pass the
+    relevant budget values directly into AgenticProjectRuntime. Without this,
+    `max_candidates_per_task: 1` is ignored and change runs burn all default
+    candidate strategies.
+    """
+    kwargs: dict[str, int] = {}
+    max_candidates = budgets.get("max_candidates_per_task")
+    if isinstance(max_candidates, int) and max_candidates >= 1:
+        kwargs["candidate_count"] = max_candidates
+    max_repair = budgets.get("max_repair_attempts_per_candidate")
+    if isinstance(max_repair, int) and max_repair >= 0:
+        kwargs["max_repair_loops"] = max_repair
+    return kwargs
+
+
 def cmd_change_run(args: argparse.Namespace) -> None:
     """RC-4A.2: drive a change session through AutonomousController.
 
@@ -4037,7 +4113,7 @@ def cmd_change_run(args: argparse.Namespace) -> None:
     from orchestrator.core.change_contract import resolve_change_id
     from orchestrator.core.change_runner import run_change
     from orchestrator.core.run_package import apply_selected_candidate
-    from orchestrator.core.deploy import load_agentic_config
+    from orchestrator.core.deploy import load_agentic_config, load_autonomous_overrides
 
     paths = _initialized_paths(args.root)
     engine = create_engine(paths)
@@ -4052,6 +4128,8 @@ def cmd_change_run(args: argparse.Namespace) -> None:
 
     runtime = AgenticProjectRuntime(engine.db)
     agentic_config = load_agentic_config(project_path)
+    autonomous_overrides = load_autonomous_overrides(project_path)
+    budget_kwargs = _agentic_runtime_budget_kwargs_from_overrides(autonomous_overrides.budgets)
 
     def _run_inner_loop(*, project: dict[str, Any], intent_overrides: dict[str, Any]) -> AgenticRunResult:
         return runtime.run(
@@ -4063,6 +4141,13 @@ def cmd_change_run(args: argparse.Namespace) -> None:
             codex_sandbox=agentic_config.codex.sandbox,
             codex_ask_for_approval=agentic_config.codex.ask_for_approval,
             codex_command=agentic_config.codex.command,
+            # Change requests are already scoped. With the current
+            # single-candidate Studio budget, spend the first attempt on a
+            # small conservative patch; test-focused candidates can be useful
+            # as additional candidates, but are too expensive as the only
+            # candidate for tiny UI/copy changes.
+            candidate_strategy_order=["conservative", "test-focused", "broader-fix"],
+            **budget_kwargs,
         )
 
     def _apply(*, project_path: Path, run_dir: Path, selected_candidate: str) -> dict[str, Any]:

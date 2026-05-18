@@ -188,6 +188,23 @@ def run_change(
     started_iso = started_dt.isoformat(timespec="seconds")
     started_ts = started_dt.timestamp()
 
+    # RC-5A.13: pre-Codex scope guard. A change with no scope_paths
+    # cannot be safely handed to Codex — even if the patch is fine, the
+    # Apply Gate's diff-within-scope check will reject every file.
+    # Failing fast here saves Codex tokens and avoids consuming the
+    # session's needs_human_review budget.
+    scope_paths_in_contract = list(contract.get("scope_paths") or [])
+    if contract.get("scope_missing") or not scope_paths_in_contract:
+        return _emit_missing_scope_failure(
+            project_path=project_path,
+            cdir=cdir,
+            change_id=change_id,
+            contract=contract,
+            change_dir_relpath=change_dir_relpath,
+            started_iso=started_iso,
+            started_ts=started_ts,
+        )
+
     # Build single-task task-graph and swap it in (preserve existing graph).
     new_graph = build_change_task_graph(
         change_id=change_id, contract=contract,
@@ -202,11 +219,19 @@ def run_change(
     )
 
     try:
-        session = controller.start_or_resume()
+        # RC-5A.13: thread change_id so the controller can refuse to
+        # resume a session that belongs to a different change_id (or one
+        # that's paused on a budget reason). Otherwise a fresh change run
+        # would silently inherit the prior change's exhausted budget.
+        session = controller.start_or_resume(change_id=change_id)
 
         # Override branch to `agentic/change/<change_id>` for evidence trail.
         branch_name = f"{CHANGE_BRANCH_PREFIX}/{change_id}"
         session.branch = branch_name
+        # Make sure the session record carries change_id even when we
+        # resumed a same-change session that pre-dated the schema bump.
+        if getattr(session, "change_id", None) != change_id:
+            session.change_id = change_id
         controller._save_session(session)
         _create_or_checkout_branch(project_path, branch_name)
 
@@ -258,6 +283,85 @@ def run_change(
         started_at=started_iso,
         completed_at=completed_iso,
         elapsed_sec=elapsed_sec,
+    )
+
+
+# ---------------------------------------------------------------------------
+# RC-5A.13: pre-Codex scope guard
+# ---------------------------------------------------------------------------
+MISSING_SCOPE_REASON = "missing_scope_paths"
+
+
+def _emit_missing_scope_failure(
+    *,
+    project_path: Path,
+    cdir: Path,
+    change_id: str,
+    contract: dict[str, Any],
+    change_dir_relpath: str,
+    started_iso: str,
+    started_ts: float,
+) -> ChangeRunResult:
+    """Short-circuit a change run when scope_paths is empty / missing.
+
+    Writes a `failed` delivery-report.md with reason `missing_scope_paths`
+    and returns immediately — Codex is NOT called, no agentic run is
+    created, no candidate budget is consumed, no autonomous session is
+    touched. The operator sees a deterministic failure surface they can
+    fix by editing the change-request.md and re-running `change new`.
+
+    The renderer's `risks` channel carries the diagnostic so
+    delivery-report.md prominently displays WHY this change refused to
+    run, instead of the generic "no validation results" the user saw
+    during the dogfood incident.
+    """
+    completed_dt = datetime.now(timezone.utc)
+    completed_iso = completed_dt.isoformat(timespec="seconds")
+    elapsed_sec = round(completed_dt.timestamp() - started_ts, 3)
+
+    delivery_result = {
+        "change_id": change_id,
+        "result": "failed",
+        "goal": contract.get("goal"),
+        "files_touched": [],
+        # Renderer expects { name: { passed, ... } }. We surface a single
+        # synthetic row whose "passed" is False so the Validation section
+        # of delivery-report.md prominently shows the gate refused.
+        "validation": {
+            "scope_paths": {
+                "passed": False,
+                "detail": MISSING_SCOPE_REASON,
+            },
+        },
+        "risks": [
+            (
+                "Refused to run: change-contract.json has no scope_paths "
+                f"(reason: {MISSING_SCOPE_REASON}). Add a `## Scope paths` "
+                "section (or `Scope: a, b` inline) to change-request.md "
+                "listing the directories this change is allowed to touch, "
+                "then run `agent-studio change new --from <path>` again."
+            ),
+        ],
+        "commit": {},
+        "review_queue": {"open_count": 0, "items": []},
+        "elapsed_sec": elapsed_sec,
+        "created_at": started_iso,
+        "completed_at": completed_iso,
+    }
+    delivery_report_path = cdir / "delivery-report.md"
+    delivery_report_path.write_text(
+        render_delivery_report(delivery_result), encoding="utf-8"
+    )
+
+    return ChangeRunResult(
+        change_id=change_id,
+        result="failed",
+        delivery_report_path=delivery_report_path,
+        applied_change_path=None,
+        session_id=None,
+        task_id=f"change-{change_id}",
+        commit_sha=None,
+        review_open_count=0,
     )
 
 

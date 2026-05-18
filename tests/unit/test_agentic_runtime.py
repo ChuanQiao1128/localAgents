@@ -32,6 +32,7 @@ from orchestrator.core.agentic_runtime import (
     _read_prior_memory_updates,
     _run_repair_loop,
     _score_candidate,
+    _select_candidate_strategies,
     _validate_candidate_score,
     _validate_changed_files,
     _validate_promotion_report_v2,
@@ -1391,6 +1392,28 @@ class ContextPackPriorLearningsTests(unittest.TestCase):
             self.assertEqual(context["prior_learnings"], [])
             self.assertEqual(context["prior_run_count"], 0)
 
+    def test_context_pack_never_includes_env_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            (project / "package.json").write_text('{"scripts":{"build":"echo ok"}}', encoding="utf-8")
+            (project / ".env.local").write_text("SECRET_TOKEN=do-not-read", encoding="utf-8")
+            (project / "app").mkdir()
+            (project / "app" / "page.tsx").write_text("export default function Page(){return null}", encoding="utf-8")
+            (project / "lib").mkdir()
+            (project / "lib" / ".env.production").write_text("OTHER_SECRET=do-not-read", encoding="utf-8")
+            (project / "lib" / "naturalize.ts").write_text("export const x = 1", encoding="utf-8")
+
+            context = _build_context_pack(project, {"goal": "update naturalizer"}, run_id="run_env")
+            paths = {item["path"] for item in context["relevant_files"]}
+            paths.update(context["must_include_files"])
+            paths.update(context["existing_tests"])
+            symbol_files = {item["file"] for item in context["symbols"]}
+
+            self.assertNotIn(".env.local", paths)
+            self.assertNotIn("lib/.env.production", paths)
+            self.assertNotIn(".env.local", symbol_files)
+            self.assertNotIn("lib/.env.production", symbol_files)
+
     def test_context_pack_surfaces_prior_run_learnings_and_excludes_current(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)
@@ -1658,6 +1681,26 @@ class CandidateScorerTests(unittest.TestCase):
 class MultiCandidatePromotionTests(unittest.TestCase):
     """The 8 acceptance tests Chuan listed for MVP-3A, plus a couple of
     structural checks (per-candidate score.json, three-candidate dirs)."""
+
+    def test_candidate_strategy_selection_uses_default_order(self) -> None:
+        selected = _select_candidate_strategies(1)
+        self.assertEqual(selected[0]["id"], "candidate-a")
+        self.assertEqual(selected[0]["label"], "conservative")
+
+    def test_candidate_strategy_selection_can_prefer_test_focused_first(self) -> None:
+        selected = _select_candidate_strategies(
+            1,
+            candidate_strategy_order=["test-focused"],
+        )
+        self.assertEqual(selected[0]["id"], "candidate-b")
+        self.assertEqual(selected[0]["label"], "test-focused")
+
+    def test_candidate_strategy_selection_ignores_unknown_preference(self) -> None:
+        selected = _select_candidate_strategies(
+            2,
+            candidate_strategy_order=["unknown", "candidate-c"],
+        )
+        self.assertEqual([strategy["id"] for strategy in selected], ["candidate-c", "candidate-a"])
 
     def _project_with_static_html(self, tmp: str, name: str) -> tuple[Path, dict[str, Any], Any]:
         paths = resolve_paths(tmp)

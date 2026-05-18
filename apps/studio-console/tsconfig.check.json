@@ -1,0 +1,6 @@
+{
+  "_comment": "Sandbox scratch file — safe to delete. Used once to typecheck excluding stale .next/types/. The real tsconfig is tsconfig.json.",
+  "extends": "./tsconfig.json",
+  "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx"],
+  "exclude": ["node_modules", ".next"]
+}

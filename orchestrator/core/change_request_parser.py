@@ -78,6 +78,18 @@ _HEADING_RE = re.compile(r"^(#+)\s+(.*?)\s*$")
 _BULLET_RE = re.compile(r"^\s*[-*]\s+(.+?)\s*$")
 _INLINE_LIST_RE = re.compile(r"^(scope|non[- ]goals?|acceptance)\s*:\s*(.+?)\s*$", re.IGNORECASE)
 
+# RC-5A.13: accept several human-friendly scope section names. Operators
+# (and Studio Console templates) often write `## Scope paths` instead of
+# the historical `## Scope`, or use `## Files to change` from product-doc
+# convention. All produce the same `scope_paths` list. Inline equivalents
+# (`Scope paths: a, b`) are handled by `_INLINE_SCOPE_KEYS` below.
+_SCOPE_SECTION_NAMES: tuple[str, ...] = ("scope", "scope paths", "files to change")
+_INLINE_SCOPE_KEYS: tuple[str, ...] = ("scope", "scope paths", "files to change")
+# Trim wrapping backticks from a scope path entry. RC-4C.1 found that
+# autonomous parser captured backticks literally; we apply the same
+# defensive cleanup here so `- \`app/**\`` becomes `app/**`.
+_BACKTICK_STRIP_RE = re.compile(r"^`+(.+?)`+$")
+
 
 def parse_change_request_text(text: str) -> ChangeRequest:
     """Parse change-request.md content. See module docstring for the contract.
@@ -94,9 +106,20 @@ def parse_change_request_text(text: str) -> ChangeRequest:
             "change-request.md has no goal. Add a `## Goal` section, or put a paragraph as the first non-heading content."
         )
 
-    scope_paths = _extract_list(sections, "scope") + _extract_inline_list(text, "scope")
+    # RC-5A.13: accept all recognized scope section names (`## Scope`,
+    # `## Scope paths`, `## Files to change`) and the matching inline
+    # `Scope: …` / `Scope paths: …` / `Files to change: …` lines.
+    scope_paths: list[str] = []
+    for name in _SCOPE_SECTION_NAMES:
+        scope_paths.extend(_extract_list(sections, name))
+    for inline_key in _INLINE_SCOPE_KEYS:
+        scope_paths.extend(_extract_inline_list(text, inline_key))
+    # Strip wrapping backticks per item, drop blanks. Defensive cleanup so
+    # `- \`app/**\`` becomes `app/**`.
+    scope_paths = [_strip_backticks(p) for p in scope_paths if p and p.strip()]
+
     non_goals = _extract_list(sections, "non-goals") + _extract_list(sections, "non goals") + _extract_inline_list(text, "non-goals") + _extract_inline_list(text, "non goals")
-    acceptance = _extract_list(sections, "acceptance") + _extract_inline_list(text, "acceptance")
+    acceptance = _extract_list(sections, "acceptance") + _extract_list(sections, "acceptance criteria") + _extract_inline_list(text, "acceptance")
 
     # Dedupe while preserving order — markdown layouts often repeat.
     scope_paths = _ordered_unique(scope_paths)
@@ -231,3 +254,17 @@ def _ordered_unique(items: list[str]) -> list[str]:
             seen.add(item)
             result.append(item)
     return result
+
+
+def _strip_backticks(value: str) -> str:
+    """Remove a single layer of wrapping backticks, e.g. `` `app/**` `` → ``app/**``.
+
+    Embedded backticks inside the path (rare) are left alone — we only
+    strip leading/trailing groups to keep the path glob legible.
+    """
+    if not value:
+        return value
+    match = _BACKTICK_STRIP_RE.match(value.strip())
+    if match:
+        return match.group(1).strip()
+    return value.strip()

@@ -156,6 +156,108 @@ class ChangeRequestParserTests(unittest.TestCase):
         with self.assertRaises(ChangeRequestParseError):
             parse_change_request_file("/nonexistent/path/change-request.md")
 
+    # ----- RC-5A.13: parser hardening -----------------------------------
+
+    def test_parses_scope_paths_heading(self) -> None:
+        """`## Scope paths` (the heading variant the dogfood test used)
+        must produce the same `scope_paths` as the historical `## Scope`."""
+        text = (
+            "## Goal\n"
+            "Add the thing.\n"
+            "\n"
+            "## Scope paths\n"
+            "- app/**\n"
+            "- components/**\n"
+            "- lib/**\n"
+            "\n"
+            "## Acceptance\n"
+            "- Build passes.\n"
+        )
+        parsed = parse_change_request_text(text)
+        self.assertEqual(
+            parsed.scope_paths,
+            ["app/**", "components/**", "lib/**"],
+        )
+        self.assertFalse(parsed.scope_missing)
+
+    def test_parses_files_to_change_heading(self) -> None:
+        """`## Files to change` (product-doc convention) maps to scope_paths."""
+        text = (
+            "## Goal\n"
+            "Refactor footer.\n"
+            "\n"
+            "## Files to change\n"
+            "- app/footer.tsx\n"
+            "- components/Footer.tsx\n"
+            "\n"
+            "## Acceptance\n"
+            "- Build passes.\n"
+        )
+        parsed = parse_change_request_text(text)
+        self.assertEqual(
+            parsed.scope_paths,
+            ["app/footer.tsx", "components/Footer.tsx"],
+        )
+        self.assertFalse(parsed.scope_missing)
+
+    def test_strips_wrapping_backticks_from_scope(self) -> None:
+        """`` - `app/**` `` becomes `app/**` — RC-4C.1 found that
+        autonomous parser captured backticks literally, so we apply the
+        same defensive cleanup at the change parser layer."""
+        text = (
+            "## Goal\n"
+            "Tweak the page.\n"
+            "\n"
+            "## Scope paths\n"
+            "- `app/**`\n"
+            "- `components/Editor.tsx`\n"
+            "\n"
+            "## Acceptance\n"
+            "- Build passes.\n"
+        )
+        parsed = parse_change_request_text(text)
+        self.assertEqual(
+            parsed.scope_paths,
+            ["app/**", "components/Editor.tsx"],
+        )
+
+    def test_inline_scope_paths_alias(self) -> None:
+        """Inline `Scope paths: a, b` works just like `Scope: a, b`."""
+        text = (
+            "## Goal\n"
+            "Refactor.\n"
+            "\n"
+            "Scope paths: app/page.tsx, components/Editor.tsx\n"
+            "\n"
+            "## Acceptance\n"
+            "- Build passes.\n"
+        )
+        parsed = parse_change_request_text(text)
+        self.assertIn("app/page.tsx", parsed.scope_paths)
+        self.assertIn("components/Editor.tsx", parsed.scope_paths)
+
+    def test_inline_files_to_change_alias(self) -> None:
+        text = (
+            "## Goal\nRefactor.\n\n"
+            "Files to change: a, b, c\n\n"
+            "## Acceptance\n- Build passes.\n"
+        )
+        parsed = parse_change_request_text(text)
+        self.assertEqual(parsed.scope_paths, ["a", "b", "c"])
+
+    def test_acceptance_criteria_heading_alias(self) -> None:
+        """`## Acceptance criteria` should work just like `## Acceptance`."""
+        text = (
+            "## Goal\nRefactor.\n\n"
+            "## Scope paths\n- app/**\n\n"
+            "## Acceptance criteria\n- Build passes.\n- Typecheck passes.\n"
+        )
+        parsed = parse_change_request_text(text)
+        self.assertEqual(
+            parsed.acceptance,
+            ["Build passes.", "Typecheck passes."],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

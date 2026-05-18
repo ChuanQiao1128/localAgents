@@ -3,10 +3,12 @@
   "private": true,
   "version": "0.1.0",
   "workspaces": [
-    "apps/dashboard"
+    "apps/studio-console"
   ],
   "scripts": {
-    "dashboard": "npm --workspace apps/dashboard run dev",
+    "studio": "npm --workspace apps/studio-console run dev",
+    "studio:typecheck": "npm --workspace apps/studio-console run typecheck",
+    "studio:build": "npm --workspace apps/studio-console run build",
     "test": "python3 -m unittest discover -s tests"
   }
 }

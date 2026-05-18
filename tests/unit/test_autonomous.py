@@ -488,6 +488,102 @@ class FindActiveSessionTests(unittest.TestCase):
             self.assertEqual(found.session_id, session.session_id)
 
 
+class StartOrResumeChangeIdTests(unittest.TestCase):
+    """RC-5A.13: when a new change_id arrives, `start_or_resume` must NOT
+    reuse a session that belongs to a different change. This was the
+    root cause of session_c1de... being silently re-paused on
+    `budget:max_needs_human_review_tasks` when change_10f6... ran."""
+
+    def _new_controller(self, tmp: str) -> AutonomousController:
+        project = {"id": "p", "name": "x", "path": tmp}
+        return AutonomousController(project=project, run_inner_loop=lambda **kw: None)
+
+    def test_resumes_when_change_id_matches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctl = self._new_controller(tmp)
+            first = ctl.start_or_resume(change_id="change_aaa")
+            self.assertEqual(first.change_id, "change_aaa")
+            second = ctl.start_or_resume(change_id="change_aaa")
+            self.assertEqual(
+                second.session_id, first.session_id,
+                msg="same change_id must resume the same session",
+            )
+
+    def test_creates_new_session_for_different_change_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctl = self._new_controller(tmp)
+            first = ctl.start_or_resume(change_id="change_aaa")
+            # Simulate the prior change pausing on a budget reason —
+            # exactly the dogfood scenario.
+            first.status = "paused"
+            first.pause_reason = "budget:max_needs_human_review_tasks"
+            ctl._save_session(first)
+
+            second = ctl.start_or_resume(change_id="change_bbb")
+            self.assertNotEqual(
+                second.session_id, first.session_id,
+                msg="different change_id MUST get a fresh session",
+            )
+            self.assertEqual(second.change_id, "change_bbb")
+            self.assertEqual(second.status, "running")
+            self.assertIsNone(second.pause_reason)
+
+    def test_creates_new_session_when_prior_paused_on_budget_same_change(self) -> None:
+        """Even with the SAME change_id, if the prior session is paused
+        on a budget reason, we should create a fresh one — otherwise the
+        budget would re-fire immediately on resume."""
+        with tempfile.TemporaryDirectory() as tmp:
+            ctl = self._new_controller(tmp)
+            first = ctl.start_or_resume(change_id="change_aaa")
+            first.status = "paused"
+            first.pause_reason = "budget:max_needs_human_review_tasks"
+            ctl._save_session(first)
+
+            second = ctl.start_or_resume(change_id="change_aaa")
+            self.assertNotEqual(second.session_id, first.session_id)
+            self.assertIsNone(second.pause_reason)
+
+    def test_change_run_does_not_resume_autonomous_mode_session(self) -> None:
+        """An existing autonomous-mode session (change_id is None) must
+        NOT be resumed by a change run — the change should get a fresh
+        change-bound session."""
+        with tempfile.TemporaryDirectory() as tmp:
+            ctl = self._new_controller(tmp)
+            autonomous = ctl.start_or_resume()  # change_id=None
+            self.assertIsNone(autonomous.change_id)
+
+            change_session = ctl.start_or_resume(change_id="change_aaa")
+            self.assertNotEqual(change_session.session_id, autonomous.session_id)
+            self.assertEqual(change_session.change_id, "change_aaa")
+
+    def test_plain_autonomous_resume_still_resumes_paused_budget(self) -> None:
+        """Backward-compat: plain `autonomous resume` (no change_id)
+        keeps the historical "always resume" semantics, even if the
+        prior session was budget-paused. The "fresh on budget" rule only
+        applies when a change_id is involved."""
+        with tempfile.TemporaryDirectory() as tmp:
+            ctl = self._new_controller(tmp)
+            first = ctl.start_or_resume()
+            first.status = "paused"
+            first.pause_reason = "budget:max_needs_human_review_tasks"
+            ctl._save_session(first)
+
+            second = ctl.start_or_resume()
+            self.assertEqual(
+                second.session_id, first.session_id,
+                msg="plain autonomous resume must keep historical resume behavior",
+            )
+
+    def test_change_id_persisted_through_round_trip(self) -> None:
+        """AutonomousSession.change_id survives to_dict / from_dict."""
+        with tempfile.TemporaryDirectory() as tmp:
+            ctl = self._new_controller(tmp)
+            ctl.start_or_resume(change_id="change_ccc")
+            found = find_active_session(Path(tmp))
+            self.assertIsNotNone(found)
+            self.assertEqual(found.change_id, "change_ccc")
+
+
 class IntegrationRunnerTests(unittest.TestCase):
     """MVP-4B unit tests for the integration phase plumbing."""
 

@@ -24,7 +24,9 @@ from orchestrator.core.artifact_validation import (
 )
 from orchestrator.core.change_runner import (
     APPLIED_CHANGE_SCHEMA_VERSION,
+    MISSING_SCOPE_REASON,
     build_change_task_graph,
+    _emit_missing_scope_failure,
     _read_eval_validation,
     _swap_task_graph,
     _restore_task_graph,
@@ -387,6 +389,125 @@ class DeliveryReportFromControllerStateTests(unittest.TestCase):
         self.assertIn("**failed**", md)
         self.assertIn("**build**: failed", md)
         self.assertEqual(validate_delivery_report_text(md), [])
+
+
+# ===========================================================================
+# RC-5A.13: pre-Codex scope guard
+# ===========================================================================
+class MissingScopeGuardTests(unittest.TestCase):
+    """A change with no scope_paths must fail BEFORE Codex / autonomous
+    is involved, write a deterministic delivery-report.md, and never
+    consume the project's needs_human_review budget."""
+
+    def _setup_cdir(self, tmp: str, change_id: str) -> tuple[Path, Path]:
+        project = Path(tmp)
+        cdir = project / ".agent" / "changes" / change_id
+        cdir.mkdir(parents=True)
+        return project, cdir
+
+    def test_emits_failed_delivery_report_with_missing_scope_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project, cdir = self._setup_cdir(tmp, "change_zzz")
+            contract = {
+                **_VALID_CONTRACT,
+                "change_id": "change_zzz",
+                "scope_paths": [],
+                "scope_missing": True,
+            }
+
+            result = _emit_missing_scope_failure(
+                project_path=project,
+                cdir=cdir,
+                change_id="change_zzz",
+                contract=contract,
+                change_dir_relpath=".agent/changes/change_zzz",
+                started_iso="2026-05-15T00:00:00+00:00",
+                started_ts=1747000000.0,
+            )
+
+            self.assertEqual(result.result, "failed")
+            self.assertEqual(result.change_id, "change_zzz")
+            # No session was created.
+            self.assertIsNone(result.session_id)
+            # No commit because Codex was never called.
+            self.assertIsNone(result.commit_sha)
+            self.assertIsNone(result.applied_change_path)
+
+            # delivery-report.md exists, displays the failure reason, and
+            # validates clean against agentic.delivery_report.v1.
+            self.assertTrue(result.delivery_report_path.exists())
+            md = result.delivery_report_path.read_text(encoding="utf-8")
+            self.assertIn("**failed**", md)
+            self.assertIn(MISSING_SCOPE_REASON, md)
+            self.assertEqual(validate_delivery_report_text(md), [])
+
+    def test_pre_codex_guard_does_not_invoke_inner_loop(self) -> None:
+        """Drive run_change with a real (but tiny) git repo + scope_missing
+        contract. Verify the injected `run_inner_loop` is NEVER called and
+        the controller never creates a session."""
+        import subprocess as sp
+
+        from orchestrator.core.change_contract import create_change
+        from orchestrator.core.change_runner import run_change
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project_path = Path(tmp)
+            sp.run(["git", "init", "-q", "-b", "main"], cwd=project_path, check=True)
+            sp.run(["git", "config", "user.email", "test@example.com"], cwd=project_path, check=True)
+            sp.run(["git", "config", "user.name", "Test"], cwd=project_path, check=True)
+            (project_path / "README.md").write_text("# test\n", encoding="utf-8")
+            sp.run(["git", "add", "."], cwd=project_path, check=True)
+            sp.run(["git", "commit", "-q", "-m", "init"], cwd=project_path, check=True)
+
+            # Write change-request.md with NO scope section. Parser flags
+            # scope_missing=True; create_change persists that into the
+            # contract.
+            cr_path = project_path / "change-request.md"
+            cr_path.write_text(
+                "## Goal\nAdd footer.\n\n## Acceptance\n- Footer renders.\n",
+                encoding="utf-8",
+            )
+            created = create_change(
+                project_path=project_path,
+                change_request_path=cr_path,
+            )
+            change_id = created.change_id
+            # The change dir + change-request.md are now untracked → the
+            # change_runner's worktree-clean preflight would refuse. Commit
+            # so we exercise ONLY the pre-Codex guard, not preflight.
+            sp.run(["git", "add", "."], cwd=project_path, check=True)
+            sp.run(["git", "commit", "-q", "-m", "seed change"], cwd=project_path, check=True)
+
+            inner_loop_calls: list[Any] = []
+
+            def fake_inner_loop(*args: Any, **kwargs: Any) -> Any:
+                inner_loop_calls.append((args, kwargs))
+                raise AssertionError(
+                    "pre-Codex guard failure: inner loop was called even though "
+                    "scope_paths is empty"
+                )
+
+            project = {"id": "test-project", "path": str(project_path)}
+            result = run_change(
+                project=project,
+                change_id=change_id,
+                run_inner_loop=fake_inner_loop,
+            )
+
+            self.assertEqual(result.result, "failed")
+            self.assertEqual(inner_loop_calls, [], "inner loop must not be called")
+            self.assertIsNone(result.session_id)
+            self.assertIsNone(result.commit_sha)
+            # Sessions dir should not have been created.
+            sessions_dir = project_path / ".agent" / "autonomous" / "sessions"
+            if sessions_dir.exists():
+                self.assertEqual(
+                    list(sessions_dir.iterdir()),
+                    [],
+                    "no session should have been created",
+                )
+            md = result.delivery_report_path.read_text(encoding="utf-8")
+            self.assertIn(MISSING_SCOPE_REASON, md)
 
 
 if __name__ == "__main__":

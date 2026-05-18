@@ -3,14 +3,25 @@ __pycache__/
 .pytest_cache/
 .coverage
 .agent-studio/
+.studio-console/
+.claude/
+.vscode/
+.wrangler/
 .venv/
 .env
 .env.local
 .env.*.local
 node_modules/
 .next/
+apps/studio-console/.next/
+apps/studio-console/.next.bak*/
+apps/studio-console/*.tsbuildinfo
 dist/
 build/
+sites/
+pytest-cache-files-*/
+*.log
+*.pid
 
 apps/dashboard/AGENTS.md
 apps/dashboard/CLAUDE.md
@@ -26,4 +37,3 @@ dist/
 .dogfood/_*/
 .dogfood/rc3*/
 .dogfood/rc4a3-change-run-tiny/
-.dogfood/rc2-creator-tracker/vercel.json

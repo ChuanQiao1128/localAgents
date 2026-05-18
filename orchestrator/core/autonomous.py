@@ -496,6 +496,11 @@ class AutonomousSession:
     deployment: dict[str, Any] = field(default_factory=lambda: dict(DEFAULT_DEPLOYMENT_STATE))
     pause_reason: str | None = None
     halt_requested: bool = False
+    # RC-5A.13: when this session was created for a change-mode run,
+    # `change_id` records which change owns it. Plain autonomous-mode
+    # sessions leave this as None. Drives the "fresh session per change"
+    # rule in `start_or_resume`.
+    change_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -514,6 +519,7 @@ class AutonomousSession:
             "deployment": self.deployment,
             "pause_reason": self.pause_reason,
             "halt_requested": self.halt_requested,
+            "change_id": self.change_id,
         }
 
     @classmethod
@@ -547,6 +553,11 @@ class AutonomousSession:
             deployment={**DEFAULT_DEPLOYMENT_STATE, **(payload.get("deployment") or {})},
             pause_reason=payload.get("pause_reason"),
             halt_requested=bool(payload.get("halt_requested") or False),
+            change_id=(
+                str(payload["change_id"])
+                if payload.get("change_id") is not None
+                else None
+            ),
         )
 
 
@@ -1190,17 +1201,66 @@ class AutonomousController:
         self.apply_candidate = apply_candidate
 
     # -- session lifecycle ------------------------------------------------
-    def start_or_resume(self) -> AutonomousSession:
+    def start_or_resume(
+        self,
+        *,
+        change_id: str | None = None,
+    ) -> AutonomousSession:
+        """Start a new autonomous session, or resume the active one.
+
+        RC-5A.13: when called from change-mode (`change_id` is not None),
+        the resume rule is tightened so a NEW change never reuses a
+        session that belonged to a DIFFERENT change. This prevents the
+        bug where `change_10f6...` resumed `session_c1de...` (which was
+        for `change_a2f...`) and immediately re-paused on
+        `budget:max_needs_human_review_tasks` because the prior change's
+        rejected review still counted toward the per-session budget.
+
+        Behavior matrix:
+        - change_id is None (plain autonomous mode): resume any
+          {running, paused} session, or create new if none. Unchanged.
+        - change_id is set, existing session has matching change_id:
+          resume.
+        - change_id is set, existing session has DIFFERENT change_id (or
+          None — i.e. an autonomous-mode session): create a fresh
+          change-bound session.
+        - change_id is set, existing session paused with budget reason:
+          create fresh (the budget would re-trigger immediately on
+          resume).
+        """
         existing = find_active_session(self.project_path)
         now = now_iso()
         if existing is not None and existing.status in {"running", "paused"}:
-            existing.status = "running"
-            existing.updated_at = now
-            existing.halt_requested = False
-            existing.pause_reason = None
-            self._save_session(existing)
-            self._log(existing.session_id, {"event": "session_resumed", "session_id": existing.session_id})
-            return existing
+            should_fork_new = False
+            if change_id is not None:
+                existing_change_id = getattr(existing, "change_id", None)
+                if existing_change_id != change_id:
+                    should_fork_new = True
+                    self._log(existing.session_id, {
+                        "event": "session_skipped_for_new_change",
+                        "session_id": existing.session_id,
+                        "existing_change_id": existing_change_id,
+                        "new_change_id": change_id,
+                    })
+                elif (existing.pause_reason or "").startswith("budget:"):
+                    should_fork_new = True
+                    self._log(existing.session_id, {
+                        "event": "session_skipped_budget_exhausted",
+                        "session_id": existing.session_id,
+                        "pause_reason": existing.pause_reason,
+                    })
+            if not should_fork_new:
+                existing.status = "running"
+                existing.updated_at = now
+                existing.halt_requested = False
+                existing.pause_reason = None
+                # If the existing session matches but lacks change_id metadata
+                # (older session or first-resume after schema bump), tag it.
+                if change_id is not None and existing.change_id is None:
+                    existing.change_id = change_id
+                self._save_session(existing)
+                self._log(existing.session_id, {"event": "session_resumed", "session_id": existing.session_id})
+                return existing
         session_id = "session_" + short_id("auto").split("_", 1)[-1]
         branch = session_branch_name(session_id)
         session = AutonomousSession(
@@ -1212,6 +1272,7 @@ class AutonomousController:
             branch=branch,
             started_at=now,
             updated_at=now,
+            change_id=change_id,
         )
         # RC-2C: merge optional `autonomous.budgets` + `integration:` blocks
         # from agent-studio.yaml into the new session. Existing on-disk

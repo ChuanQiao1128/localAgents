@@ -3,8 +3,10 @@ from __future__ import annotations
 import fnmatch
 import difflib
 import json
+import os
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -57,6 +59,7 @@ class AgenticProjectRuntime:
         codex_sandbox: str = "workspace-write",
         codex_ask_for_approval: str = "on-request",
         codex_command: str = "codex",
+        candidate_strategy_order: list[str] | None = None,
     ) -> AgenticRunResult:
         project_path = Path(str(project["path"]))
         project_path.mkdir(parents=True, exist_ok=True)
@@ -122,9 +125,14 @@ class AgenticProjectRuntime:
             written.append(_write_json(project_path, run_dir / "eval-harness.json", eval_harness))
 
             # MVP-3A: pick the strategies for this run. candidate_count is
-            # clamped between 1 and len(CANDIDATE_STRATEGIES); 1 produces a
-            # single candidate-a (backward-compatible single-candidate mode).
-            strategies = CANDIDATE_STRATEGIES[: max(1, min(int(candidate_count), len(CANDIDATE_STRATEGIES)))]
+            # clamped between 1 and len(CANDIDATE_STRATEGIES). Callers may
+            # provide a preferred strategy order for workflow-specific cases
+            # such as change mode, where a test-focused candidate is usually
+            # a better first spend than a minimal conservative patch.
+            strategies = _select_candidate_strategies(
+                candidate_count,
+                candidate_strategy_order=candidate_strategy_order,
+            )
 
             record("task-slicing", "Defined permission-bounded agentic task slices.")
             task_slices = _build_task_slices(intent, eval_harness)
@@ -581,6 +589,45 @@ CANDIDATE_STRATEGIES: list[dict[str, str]] = [
 ]
 
 
+def _select_candidate_strategies(
+    candidate_count: int,
+    *,
+    candidate_strategy_order: list[str] | None = None,
+) -> list[dict[str, str]]:
+    """Return the candidate strategies for a run, honoring an optional order.
+
+    The runtime's default order stays conservative for greenfield/autonomous
+    runs. Change runs may pass a different order so a constrained single
+    candidate budget can spend the first attempt on a more useful strategy.
+    """
+    ordered: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    for requested in candidate_strategy_order or []:
+        key = str(requested).strip().lower()
+        if not key:
+            continue
+        match = next(
+            (
+                strategy
+                for strategy in CANDIDATE_STRATEGIES
+                if strategy["id"].lower() == key or strategy["label"].lower() == key
+            ),
+            None,
+        )
+        if match and match["id"] not in seen:
+            ordered.append(match)
+            seen.add(match["id"])
+
+    for strategy in CANDIDATE_STRATEGIES:
+        if strategy["id"] not in seen:
+            ordered.append(strategy)
+            seen.add(strategy["id"])
+
+    limit = max(1, min(int(candidate_count), len(ordered)))
+    return ordered[:limit]
+
+
 def _build_candidate(
     project_path: Path,
     run_dir: Path,
@@ -778,15 +825,68 @@ def codex_cli_available(*, command: str = "codex") -> bool:
 def _default_codex_runner(command: list[str], cwd: Path, timeout_sec: int) -> Any:
     """Subprocess.run wrapper. Extracted so unit tests can swap a fake
     runner that returns a synthetic completed-process without forking."""
+    return _run_command_with_process_group_timeout(command, cwd, timeout_sec)
+
+
+def _run_command_with_process_group_timeout(command: list[str], cwd: Path, timeout_sec: int) -> subprocess.CompletedProcess[str]:
+    """Run a command in a new process group and kill the whole group on timeout.
+
+    Codex can spawn nested tool commands such as `npm run build`. Killing only
+    the Codex parent leaves those children writing into the candidate worktree,
+    which can corrupt the next eval run. A process group timeout keeps the
+    candidate workspace deterministic.
+    """
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
     try:
-        return subprocess.run(
-            command, cwd=cwd, text=True, capture_output=True,
-            timeout=timeout_sec, check=False,
-        )
+        stdout, stderr = process.communicate(timeout=timeout_sec)
     except subprocess.TimeoutExpired as exc:
-        # Re-raise so the caller can record a structured codex_cli_timeout
-        # failure with the partial stdout/stderr the timeout exposes.
-        raise
+        _terminate_process_group(process)
+        stdout, stderr = process.communicate()
+        raise subprocess.TimeoutExpired(
+            command,
+            timeout_sec,
+            output=stdout if isinstance(stdout, str) else exc.output,
+            stderr=stderr if isinstance(stderr, str) else exc.stderr,
+        ) from exc
+    _terminate_process_group_members(process.pid)
+    return subprocess.CompletedProcess(
+        command,
+        process.returncode,
+        stdout or "",
+        stderr or "",
+    )
+
+
+def _terminate_process_group(process: subprocess.Popen[str]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except OSError:
+        return
+    try:
+        process.wait(timeout=5)
+        return
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            return
+
+
+def _terminate_process_group_members(pid: int) -> None:
+    """Best-effort cleanup for descendants left behind after parent exit."""
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except (ProcessLookupError, OSError):
+        return
 
 
 def build_codex_patch_worker_command(
@@ -903,6 +1003,30 @@ def _run_codex_patch_worker(
     except FileNotFoundError:
         return _patch_worker_failure("codex_cli_not_found", {"worktree_path": str(worktree)})
     except subprocess.TimeoutExpired as exc:
+        diff_result = _diff_directories(
+            project_path,
+            worktree,
+            intent["allowed_change_scope"]["paths"],
+            candidate_id=candidate_id,
+        )
+        if diff_result["source_patch_present"]:
+            return {
+                "patch_status": "generated",
+                "reason": "codex_cli_timeout_with_patch",
+                "details": {
+                    "worker": "codex",
+                    "model": model,
+                    "returncode": None,
+                    "worktree_path": str(worktree),
+                    "timeout_sec": timeout_sec,
+                    "stdout_tail": (exc.stdout or "")[-4000:] if isinstance(exc.stdout, str) else "",
+                    "stderr_tail": (exc.stderr or "")[-4000:] if isinstance(exc.stderr, str) else "",
+                    "last_message_path": str(output_path),
+                },
+                "worktree_path": str(worktree),
+                "patch_diff": diff_result["patch_diff"],
+                "changed_files": diff_result["changed_files"],
+            }
         return _patch_worker_failure(
             "codex_cli_timeout",
             {
@@ -913,7 +1037,12 @@ def _run_codex_patch_worker(
             },
         )
 
-    diff_result = _diff_directories(project_path, worktree, intent["allowed_change_scope"]["paths"])
+    diff_result = _diff_directories(
+        project_path,
+        worktree,
+        intent["allowed_change_scope"]["paths"],
+        candidate_id=candidate_id,
+    )
     status = "generated" if diff_result["source_patch_present"] else "not_generated"
     reason = "source_patch_generated" if status == "generated" else "empty_or_non_source_diff"
     if completed.returncode != 0 and status != "generated":
@@ -1001,6 +1130,7 @@ def _run_repair_loop(
             }
         )
         repair_result = _run_codex_repair_agent(
+            project_path=project_path,
             run_dir=run_dir,
             worktree_path=Path(worktree_path),
             intent=intent,
@@ -1029,9 +1159,14 @@ def _run_repair_loop(
             break
 
         diff_result = _diff_directories(project_path, Path(worktree_path), intent["allowed_change_scope"]["paths"])
+        repair_base_commit = (
+            _run_git(project_path, ["rev-parse", "--short", "HEAD"])
+            or str(candidate.get("changed_files", {}).get("base_commit") or "")
+            or "unknown"
+        )
         _refresh_candidate_patch(
             candidate,
-            context_commit="working-tree",
+            context_commit=repair_base_commit,
             diff_result=diff_result,
             patch_status="generated" if diff_result["source_patch_present"] else "not_generated",
             patch_reason="repair_patch_generated" if diff_result["source_patch_present"] else "repair_empty_or_non_source_diff",
@@ -1108,6 +1243,7 @@ def _refresh_candidate_patch(
 
 def _run_codex_repair_agent(
     *,
+    project_path: Path,
     run_dir: Path,
     worktree_path: Path,
     intent: dict[str, Any],
@@ -1125,6 +1261,8 @@ def _run_codex_repair_agent(
     prompt = _render_repair_prompt(intent, eval_harness, candidate, eval_results, failure, loop_index)
     command = [
         "codex",
+        "--ask-for-approval",
+        "never",
         "exec",
         "-C",
         str(worktree_path),
@@ -1139,17 +1277,35 @@ def _run_codex_repair_agent(
         prompt,
     ]
     try:
-        completed = subprocess.run(
+        completed = _run_command_with_process_group_timeout(
             command,
-            cwd=worktree_path,
-            text=True,
-            capture_output=True,
-            timeout=timeout_sec,
-            check=False,
+            worktree_path,
+            timeout_sec,
         )
     except FileNotFoundError:
         return {"status": "failed", "reason": "codex_cli_not_found", "details": {"worktree_path": str(worktree_path)}}
     except subprocess.TimeoutExpired as exc:
+        diff_result = _diff_directories(
+            project_path,
+            worktree_path,
+            intent["allowed_change_scope"]["paths"],
+            candidate_id=candidate_id,
+        )
+        if diff_result["source_patch_present"]:
+            return {
+                "status": "completed",
+                "reason": "repair_agent_timeout_with_patch",
+                "details": {
+                    "worker": "codex",
+                    "model": model,
+                    "returncode": None,
+                    "worktree_path": str(worktree_path),
+                    "timeout_sec": timeout_sec,
+                    "stdout_tail": (exc.stdout or "")[-4000:] if isinstance(exc.stdout, str) else "",
+                    "stderr_tail": (exc.stderr or "")[-4000:] if isinstance(exc.stderr, str) else "",
+                    "last_message_path": str(output_path),
+                },
+            }
         return {
             "status": "failed",
             "reason": "codex_cli_timeout",
@@ -1196,6 +1352,8 @@ Goal:
 
 Repair only the existing candidate in this workspace. Do not redesign unrelated areas.
 Do not edit .agent/**. Do not add dependencies. Do not write outside the workspace.
+Do not create new route, error, or not-found files unless the success criteria explicitly ask for them.
+For copy, first-screen, or UI polish changes, prefer editing existing app/page.tsx and app/layout.tsx only.
 
 Allowed path globs:
 {json.dumps(intent["allowed_change_scope"]["paths"], indent=2)}
@@ -1583,6 +1741,8 @@ Goal:
 {success_block}{prev_block}{strategy_block}
 You must produce a real source/test/config patch in this isolated workspace.
 Do not edit .agent/**. Do not add dependencies. Do not run migrations. Do not write outside the workspace.
+Do not create new route, error, or not-found files unless the success criteria explicitly ask for them.
+For copy, first-screen, or UI polish changes, prefer editing existing app/page.tsx and app/layout.tsx only.
 
 Allowed path globs:
 {json.dumps(intent["allowed_change_scope"]["paths"], indent=2)}
@@ -1599,7 +1759,13 @@ When done, leave files modified in the workspace and reply with a short summary 
 """
 
 
-def _diff_directories(base: Path, changed: Path, allowed_paths: list[str]) -> dict[str, Any]:
+def _diff_directories(
+    base: Path,
+    changed: Path,
+    allowed_paths: list[str],
+    *,
+    candidate_id: str = "candidate-a",
+) -> dict[str, Any]:
     base_files = set(_discover_files(base))
     changed_files_set = set(_discover_files(changed))
     all_paths = sorted((base_files | changed_files_set) - {".DS_Store"})
@@ -1635,7 +1801,7 @@ def _diff_directories(base: Path, changed: Path, allowed_paths: list[str]) -> di
         "patch_diff": patch_diff,
         "changed_files": {
             "schema_version": "agentic.changed_files.v1",
-            "candidate": "candidate-a",
+            "candidate": candidate_id,
             "base_commit": _run_git(base, ["rev-parse", "--short", "HEAD"]) or "unknown",
             "head_commit": "working-tree" if entries else None,
             "changed_files": entries,
@@ -1934,6 +2100,13 @@ def _execute_eval_command(root: Path, command: dict[str, Any], timeout_sec: int)
             "stderr": "" if passed else f"missing file: {target}",
         }
     try:
+        _prepare_eval_command_workspace(cwd, shell_command)
+        env = os.environ.copy()
+        lower_command = shell_command.lower()
+        if "next build" in lower_command or "npm run build" in lower_command:
+            env["NODE_ENV"] = "production"
+        elif env.get("NODE_ENV") not in {None, "production", "development", "test"}:
+            env.pop("NODE_ENV", None)
         completed = subprocess.run(
             shell_command,
             cwd=cwd,
@@ -1942,6 +2115,7 @@ def _execute_eval_command(root: Path, command: dict[str, Any], timeout_sec: int)
             capture_output=True,
             timeout=command_timeout,
             check=False,
+            env=env,
         )
         return {
             "name": command.get("name"),
@@ -1970,6 +2144,28 @@ def _execute_eval_command(root: Path, command: dict[str, Any], timeout_sec: int)
             "stdout": (exc.stdout or "")[-12000:] if isinstance(exc.stdout, str) else "",
             "stderr": (exc.stderr or "")[-12000:] if isinstance(exc.stderr, str) else "",
         }
+
+
+def _prepare_eval_command_workspace(cwd: Path, shell_command: str) -> None:
+    """Remove generated build artifacts that can make isolated eval flaky.
+
+    Next.js build output is intentionally ignored by git, but prior failed
+    evals in a candidate copy can still leave `.next` and incremental
+    TypeScript artifacts behind. Clean them before build/typecheck commands
+    so promotion depends on source state, not stale generated files.
+    """
+    lower = shell_command.lower()
+    if "next build" not in lower and "npm run build" not in lower and "npm run typecheck" not in lower:
+        return
+    for name in (".next", "tsconfig.tsbuildinfo"):
+        target = cwd / name
+        if target.is_dir():
+            shutil.rmtree(target, ignore_errors=True)
+        elif target.exists():
+            try:
+                target.unlink()
+            except OSError:
+                pass
 
 
 def _write_critic_reports(
@@ -3363,7 +3559,7 @@ def _discover_files(project_path: Path) -> list[str]:
     # trip diff_within_scope hard gate even when the actual product patch is
     # clean. *.tsbuildinfo is emitted by `tsc` whenever tsconfig has
     # `incremental: true` (the Next.js default), including under `--noEmit`.
-    ignored_file_names = {"next-env.d.ts"}
+    ignored_file_names = {"next-env.d.ts", ".npmrc", ".pypirc"}
     ignored_file_suffixes = (".tsbuildinfo",)
     files: list[str] = []
     for path in project_path.rglob("*"):
@@ -3371,6 +3567,8 @@ def _discover_files(project_path: Path) -> list[str]:
             continue
         relative = path.relative_to(project_path).as_posix()
         if any(part in ignored_dirs for part in path.relative_to(project_path).parts):
+            continue
+        if _is_secret_context_path(relative):
             continue
         if path.name in ignored_file_names:
             continue
@@ -3380,6 +3578,12 @@ def _discover_files(project_path: Path) -> list[str]:
             continue
         files.append(relative)
     return sorted(files)
+
+
+def _is_secret_context_path(path: str) -> bool:
+    """Return true for env/secret files that must never enter agent context."""
+    parts = Path(path).parts
+    return any(part.startswith(".env") for part in parts)
 
 
 _CONTEXT_BUDGET = 20

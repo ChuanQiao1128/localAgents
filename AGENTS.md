@@ -2,6 +2,547 @@
 
 ------
 
+# **当前最高优先级：把 Local Agent Studio 升级为 Agent Factory**
+
+## **0.1 当前定位**
+
+Local Agent Studio 不再被视为 Agent Factory 之外的另一个项目。它就是 Agent Factory 的 **本地 cockpit + runtime**。
+
+项目当前目标定义为：
+
+```text
+Local Agent Studio is a local-first Agent Factory runtime for turning
+product ideas and change requests into reviewed, test-verified code changes.
+```
+
+中文定位：
+
+```text
+Local Agent Studio 是一个本地优先的 Agent Factory 运行环境，
+用来把产品想法和变更请求转化为经过 review、测试验证的代码变更。
+```
+
+## **0.1.1 和 Codex / AGENTS.md / requirements.md 的关系**
+
+Codex + `AGENTS.md` + `requirements.md` 已经能完成很多一次性开发任务。Local Agent Studio 的价值不是“再包一层 Codex UI”，而是把这种手工 agent workflow 固化为一个可重复、可审计、可评估的本地开发工厂。
+
+必须长期保持这个产品边界：
+
+```text
+Codex is the execution backend.
+Local Agent Studio is the factory control system.
+```
+
+中文：
+
+```text
+Codex 是执行器。
+Local Agent Studio 是工厂控制系统。
+```
+
+Codex / Claude Code / patch-worker 负责：
+
+```text
+读代码
+改代码
+跑命令
+生成 patch
+解释局部实现
+```
+
+Studio 负责：
+
+```text
+需求生命周期
+requirements / design / tasks 的版本和审批
+workflow state machine
+run manager
+candidate patch 可解释性
+build / typecheck / test gate
+repair loop
+delivery report
+product review
+eval metrics
+可选 GitHub PR handoff
+```
+
+因此后续开发不要重复实现 Codex 已经做好的代码生成能力。优先补 Studio 独有的系统层：
+
+```text
+1. Artifact lifecycle: requirements/design/tasks/report 都有版本、hash、状态。
+2. Runtime enforcement: 未审批不能进入 implementation，不只靠 prompt obedience。
+3. Run observability: 每个 run 的阶段、命令、失败、repair 都可见。
+4. Verification gates: build/typecheck/test 不通过不能 delivered。
+5. Feedback loop: product review 能生成下一轮 scoped Change Request。
+6. Evaluation: 每个 run 产生 metrics，失败能分类和复盘。
+```
+
+这意味着后续开发不要另起一个 “Agent Factory” 项目，而是在现有 Local Agent Studio 上收敛、标准化、模块化、产品化。
+
+当前产品演进目标：
+
+```text
+从：
+  能跑 agentic coding loop 的本地 dogfood 工具
+
+升级为：
+  有标准 spec pipeline、有审批 gate、有运行可解释性、
+  有 CI repair、有 GitHub PR 集成、有 eval 的 Agent Factory。
+```
+
+## **0.2 Agent Factory 的核心原则**
+
+Agent Factory 不追求“用户一句话后无监督写代码、merge、部署”。正确目标是：
+
+```text
+Autonomous implementation,
+human-gated planning and merging.
+```
+
+中文：
+
+```text
+实现阶段高自治，
+规划和合并阶段人工把关。
+```
+
+因此任何新增自动化都必须遵守：
+
+```text
+1. agent 可以自动生成阶段产物；
+2. 用户必须能 review / 修改 / approve 关键产物；
+3. implementation 只能基于已 approve 的 requirements / design / tasks 启动；
+4. build/typecheck/test/review gate 失败不能伪装成 delivered；
+5. 高风险产品方向、安全边界、合规文案必须进入 human approval；
+6. 不允许无确认自动 merge / deploy / push production。
+```
+
+## **0.3 目标工作流**
+
+最终标准 workflow：
+
+```text
+Idea / Change Request
+  ↓
+Clarify
+  ↓
+requirements.md
+  ↓
+Approve requirements
+  ↓
+design.md
+  ↓
+Approve design
+  ↓
+tasks.md
+  ↓
+Approve tasks
+  ↓
+Implementation run
+  ↓
+Verify
+  ↓
+Review queue
+  ↓
+Delivery report
+  ↓
+Optional GitHub PR
+```
+
+后续每个 feature / change request 都应该能回答：
+
+```text
+这次需求是什么？
+谁确认了？
+设计是什么？
+谁确认了？
+任务是什么？
+谁确认了？
+agent 正在做哪个 task？
+它为什么这样改？
+它跑了哪些验证？
+失败时怎么修？
+最后交付依据是什么？
+```
+
+## **0.4 AF-1：Spec Pipeline Hardening**
+
+当前第一优先级是 AF-1，不是 GitHub PR、SaaS、多模型接入或更多 UI polish。
+
+AF-1 目标：
+
+```text
+让每个 agent run 都基于 approved requirements、approved design、approved tasks，
+并且所有 implementation、repair、delivery 都能追溯回这些已确认产物。
+```
+
+每个 project / feature / change request 应该有正式 spec lifecycle：
+
+```text
+runtime-project/
+  specs/
+    <feature-or-cr-id>/
+      requirements.md
+      design.md
+      tasks.md
+      approvals.json
+      status.json
+      design-issues.md
+      versions/
+        requirements.v1.md
+        requirements.v2.md
+        design.v1.md
+        tasks.v1.md
+      runs/
+        run-001/
+          plan.md
+          patch.diff
+          commands.log
+          verification.md
+          delivery-report.md
+```
+
+Approval 必须绑定 artifact 的版本和内容 hash，不能只记录“用户点过 approve”：
+
+```json
+{
+  "artifact": "requirements.md",
+  "version": 3,
+  "sha256": "abc123...",
+  "approved_by": "user",
+  "approved_at": "2026-05-18T10:30:00Z"
+}
+```
+
+如果 `requirements.md`、`design.md` 或 `tasks.md` 在 approval 后被修改，对应 approval 必须自动失效。
+
+AF-1 最小验收标准：
+
+```text
+1. 可以从一个 idea 创建 spec workspace。
+2. agent 可以生成 requirements.md。
+3. 用户可以手动编辑 requirements.md。
+4. 用户可以 approve requirements。
+5. requirements 改动后 approval 自动失效。
+6. agent 只能基于 approved requirements 生成 design.md。
+7. 用户可以 approve design。
+8. agent 只能基于 approved design 生成 tasks.md。
+9. 用户可以 approve tasks。
+10. implementation 只能在 tasks approved 后启动。
+11. implementation 不能直接修改 requirements/design/tasks。
+12. 如果 implementation 发现设计问题，只能写入 design-issues.md 并暂停。
+13. delivery report 必须引用 requirements/design/tasks 的 approved version/hash。
+14. UI 必须清楚显示当前 spec 状态：draft / changed_since_approval / approved / blocked。
+15. CLI 和 Studio Console 对同一 spec 状态的判断必须一致。
+```
+
+AF-1 状态机：
+
+```text
+IDEA
+  ↓
+CLARIFYING
+  ↓
+REQUIREMENTS_DRAFTED
+  ↓
+REQUIREMENTS_APPROVED
+  ↓
+DESIGN_DRAFTED
+  ↓
+DESIGN_APPROVED
+  ↓
+TASKS_DRAFTED
+  ↓
+TASKS_APPROVED
+  ↓
+IMPLEMENTING
+  ↓
+VERIFYING
+  ↓
+REVIEW_READY
+  ↓
+DELIVERED
+```
+
+异常状态：
+
+```text
+BLOCKED_NEEDS_CLARIFICATION
+BLOCKED_DESIGN_ISSUE
+BUILD_FAILED
+TYPECHECK_FAILED
+REPAIRING
+STOPPED_BY_USER
+FAILED
+```
+
+## **0.5 AF-2：Implementation Run Manager**
+
+AF-2 目标是让 implementation 从黑盒变成可解释 run。
+
+每个 implementation run 必须持续写事件：
+
+```json
+{
+  "run_id": "run_001",
+  "phase": "implementation",
+  "event_type": "command_completed",
+  "message": "npm run typecheck completed successfully",
+  "timestamp": "2026-05-18T11:02:00Z",
+  "metadata": {
+    "exit_code": 0,
+    "duration_ms": 18342
+  }
+}
+```
+
+UI 应显示：
+
+```text
+当前 run id
+当前 task id
+当前阶段：planning / editing / verifying / repairing / reviewing
+候选 patch 数量
+每个 candidate 的摘要
+为什么选择这个 candidate
+跑了哪些命令
+命令结果是什么
+失败原因是什么
+repair 尝试了几次
+最终改了哪些文件
+哪些测试通过
+哪些风险还存在
+```
+
+AF-2 验收标准：
+
+```text
+1. 长任务必须有实时 event log。
+2. Stop / Cancel 只能停止本 run 记录的 pid，不得杀错进程。
+3. Retry 必须基于失败原因和同一 approved spec，不得 silently 改 spec。
+4. Candidate patch、command trace、repair history、verification summary 必须可查看。
+5. Run failed 时必须有 failure category，不允许只有“failed”。
+```
+
+## **0.6 AF-3：CI Repair Agent**
+
+AF-3 先作为 Local Agent Studio 内部模块实现，稳定后再抽出公开 demo。
+
+职责：
+
+```text
+读取 build/typecheck/test/CI log
+  ↓
+分类失败原因
+  ↓
+定位相关文件
+  ↓
+生成 repair patch
+  ↓
+重新跑验证命令
+  ↓
+输出 repair report
+```
+
+第一版 failure categories：
+
+```text
+build_failure
+typecheck_failure
+unit_test_failure
+lint_failure
+dependency_failure
+runtime_exception
+environment_error
+spec_ambiguity
+```
+
+AF-3 验收标准：
+
+```text
+1. 本地 build/typecheck/test 失败能被分类。
+2. repair patch 必须在 allowed paths 内。
+3. repair 后必须重新跑原失败命令。
+4. 连续同类失败超过阈值时必须暂停，生成 human review item。
+5. repair report 必须说明失败原因、修改策略、验证结果、剩余风险。
+```
+
+## **0.7 AF-4：GitHub PR Integration**
+
+GitHub PR 集成排在 AF-1 / AF-2 / AF-3 之后。
+
+目标 workflow：
+
+```text
+GitHub issue / label trigger
+  ↓
+创建 feature workspace
+  ↓
+生成 requirements/design/tasks
+  ↓
+等待 approval
+  ↓
+创建 branch
+  ↓
+implementation agent 跑
+  ↓
+CI repair agent 处理失败
+  ↓
+开 PR
+  ↓
+PR body 附 delivery report
+```
+
+PR body 必须包含：
+
+```text
+## Summary
+## Linked Spec
+- requirements.md vN + hash
+- design.md vN + hash
+- tasks.md vN + hash
+## Implementation
+## Tests
+## CI / Verification
+## Risks
+## Human Review Checklist
+```
+
+阶段性 GitHub 纪律：
+
+```text
+1. 每个 AF milestone 完成后必须形成一个清晰 git commit。
+2. commit message 必须包含 milestone id，例如 `AF-1: add spec approval hashes`。
+3. push 到 GitHub 前必须通过对应 validation。
+4. 不允许把 `.env.local`、secret、真实 API key、私有日志提交到 GitHub。
+5. 不允许自动 merge；PR 必须由用户最终 review。
+6. 当前 Agent Factory 长跑已授权：每个 milestone 验证通过后可以自动 push stage branch/commit。
+```
+
+## **0.8 AF-5：Evaluation Dashboard**
+
+AF-5 目标是把 Agent Factory 从 demo 变成可评估系统。
+
+每次 run 必须写 metrics：
+
+```json
+{
+  "run_id": "run_001",
+  "feature_id": "forgot-password",
+  "phase": "implementation",
+  "status": "delivered",
+  "build_passed": true,
+  "typecheck_passed": true,
+  "tests_passed": true,
+  "repair_attempts": 2,
+  "files_changed": 5,
+  "human_approvals_required": 3,
+  "spec_drift_detected": false,
+  "duration_seconds": 840
+}
+```
+
+Dashboard 应展示：
+
+```text
+成功率
+失败类型分布
+平均 repair 次数
+平均交付时间
+spec approval 到 implementation 的转化率
+最常见失败原因
+```
+
+## **0.9 当前开发路线**
+
+后续开发顺序固定为：
+
+```text
+AF-1: Spec Pipeline Hardening
+AF-2: Implementation Run Manager
+AF-3: CI Repair Agent
+AF-4: GitHub PR Integration
+AF-5: Evaluation Dashboard
+```
+
+不要被以下方向分散：
+
+```text
+马上做 SaaS
+马上做复杂多 agent 并行
+马上接更多模型
+马上做 GitHub PR
+马上公开完整源码
+马上做生产部署
+```
+
+当前第一优先级只有一个：
+
+```text
+把 Local Agent Studio 的开发生命周期标准化。
+```
+
+长跑执行材料：
+
+```text
+requirements.md
+  Agent Factory 最终产品需求合同。定义为什么做、最终形态、功能需求、
+  人工 gate、自动执行边界、验收标准和非目标。
+
+docs/AGENT_FACTORY_LONG_RUN_PLAN.md
+  AF-1 到 AF-5/AF-6 的长跑 runbook、commit 纪律、stop conditions。
+
+docs/AF-1_SPEC_PIPELINE_PLAN.md
+  AF-1 的数据模型、状态机、子阶段、验收标准。
+
+docs/agent-factory/change-requests/AF-1A_SPEC_APPROVAL_HASHES.md
+  长跑第一步的可执行 change request。
+```
+
+后续 Codex 长跑必须先读取 `requirements.md` 和 `AGENTS.md`，再从 `AF-1A_SPEC_APPROVAL_HASHES.md` 开始。不要直接尝试一次性实现 AF-1 到 AF-5。
+
+## **0.10 安全与仓库纪律**
+
+本项目是 local-first / private-first 开发工具。任何 agent 或人工修改都必须遵守：
+
+```text
+1. 不读取、不打印、不修改、不删除 `.env.local`。
+2. 不提交 secret、API key、private token、真实用户数据。
+3. 不自动 deploy。
+4. 不自动 merge。
+5. 当前 Agent Factory 长跑可以在 milestone 验证通过后自动 git push；其他场景仍需用户确认。
+6. 不删除已有 dogfood evidence，除非用户明确要求。
+7. 对已有脏工作区必须先识别，不得覆盖用户或其他 agent 的改动。
+8. 每个阶段完成后必须输出：files changed、validation、known limitations、next step。
+```
+
+公开开源策略：
+
+```text
+可以公开：
+  ci-repair-agent-demo
+  bugfix-agent-bench
+  toy sample app
+  seeded failures
+  简化 prompts
+  架构图
+  eval metrics 格式
+  delivery report 格式
+  safety model
+
+暂时不要公开：
+  Local Agent Studio 全部源码
+  真实 agent prompts
+  真实 dogfood logs
+  真实项目数据
+  真实 run traces
+  tokens / credentials
+  私有 eval 集
+  高价值 orchestration 细节
+```
+
+------
+
 # **一、项目定位**
 
 项目暂定名：**Local Agent Dev Studio**
